@@ -1,0 +1,24 @@
+{
+  "name": "glasspro-suite",
+  "version": "1.0.0",
+  "description": "Glass Pro Suite - Shopee order processing (sync, group, validate, label PDF, history)",
+  "private": true,
+  "main": "src/index.js",
+  "engines": {
+    "node": ">=20"
+  },
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "node --watch src/index.js",
+    "test": "node --test test/",
+    "mock": "cross-env-shim",
+    "seed:mock": "node scripts/seed-mock.js"
+  },
+  "dependencies": {
+    "bcryptjs": "^2.4.3",
+    "better-sqlite3": "^12.0.0",
+    "cookie-session": "^2.1.0",
+    "express": "^4.21.2",
+    "pdf-lib": "^1.17.1"
+  }
+}
