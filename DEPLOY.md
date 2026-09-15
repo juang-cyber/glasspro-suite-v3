@@ -10,18 +10,18 @@ Waktu yang dibutuhkan: ± 10 menit klik-klik.
 
 ## 1. Kode sudah ada di GitHub
 
-Repo privat: `https://github.com/juang-cyber/glasspro-suite` (branch `main`).
+Repo privat: `https://github.com/juang-cyber/glasspro-suite-v3` (branch `main`).
 Coolify butuh akses ke repo privat lewat salah satu cara:
 
 - **GitHub App (disarankan):** Coolify → *Sources* → *+ Add* → *GitHub App* → ikuti wizard
-  (install app di akun `juang-cyber`, pilih repo `glasspro-suite`). Dengan ini *Auto Deploy* saat push aktif otomatis.
+  (install app di akun `juang-cyber`, pilih repo `glasspro-suite-v3`). Dengan ini *Auto Deploy* saat push aktif otomatis.
 - **Deploy Key:** Coolify → *Keys & Tokens* → *+ Add* → salin public key → GitHub repo → *Settings → Deploy keys → Add* (read-only).
 
 ## 2. Buat aplikasi
 
 1. Coolify → *Projects* → pilih/buat project (mis. `Glass Pro`) → environment `production` → **+ New**.
 2. Pilih **Private Repository (with GitHub App)** atau **Private Repository (with Deploy Key)** sesuai langkah 1.
-3. Repository: `juang-cyber/glasspro-suite`, branch `main`, pilih server VPS.
+3. Repository: `juang-cyber/glasspro-suite-v3`, branch `main`, pilih server VPS.
 4. **Build Pack: `Dockerfile`**. Base Directory `/`, Dockerfile Location `/Dockerfile`.
 5. **Ports Exposes: `3000`**. Ports Mappings dikosongkan.
 6. **Domains: `https://suite.glasspro.co.id`** (pakai `https://` supaya sertifikat Let's Encrypt dibuat otomatis).
@@ -98,7 +98,7 @@ Buka `http://localhost:3000`. Untuk demo tanpa Shopee: `SHOPEE_TRANSPORT=mock`.
 ## Deploy tanpa Coolify (cadangan)
 
 ```
-git clone https://github.com/juang-cyber/glasspro-suite && cd glasspro-suite
+git clone https://github.com/juang-cyber/glasspro-suite-v3 && cd glasspro-suite
 cp .env.example .env   # isi nilai
 docker compose up -d --build
 ```
