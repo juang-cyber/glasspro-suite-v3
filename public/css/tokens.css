@@ -1,0 +1,133 @@
+/* ==========================================================================
+   Glass Pro Suite — Design tokens
+   Semua warna, radius, bayangan, jarak, dan tipografi didefinisikan di sini.
+   Modul lain (base/components/pages) HANYA memakai variabel ini.
+   ========================================================================== */
+:root {
+  /* ---- Tipografi ---- */
+  --font-sans: 'Inter', system-ui, -apple-system, 'Segoe UI', Roboto, 'Helvetica Neue', Arial, sans-serif;
+  --font-mono: ui-monospace, SFMono-Regular, Menlo, Consolas, 'Liberation Mono', monospace;
+  --text-xs: 11px;
+  --text-sm: 12px;
+  --text-base: 14px;
+  --text-md: 15px;
+  --text-lg: 16px;
+  --text-xl: 18px;
+  --text-2xl: 22px;
+  --text-3xl: 28px;
+  --text-4xl: 34px;
+  --leading-tight: 1.2;
+  --leading-normal: 1.5;
+
+  /* ---- Warna dasar ---- */
+  --color-bg: #F4F5FA;
+  --color-surface: #FFFFFF;
+  --color-surface-2: #F8F9FC;
+  --color-surface-3: #F1F2F8;
+  --color-text: #111827;
+  --color-text-2: #374151;
+  --color-muted: #6B7280;
+  --color-muted-2: #9CA3AF;
+  --color-border: #E9EAF2;
+  --color-border-strong: #D9DBE8;
+
+  /* ---- Warna utama (indigo) ---- */
+  --color-primary: #5B5BD6;
+  --color-primary-hover: #4F46E5;
+  --color-primary-active: #4338CA;
+  --color-primary-soft: #EEF0FF;
+  --color-primary-soft-2: #E0E2FF;
+  --color-primary-text: #4338CA;
+  --color-primary-contrast: #FFFFFF;
+  --color-primary-ring: rgba(91, 91, 214, 0.22);
+
+  /* ---- Panel gelap (navy) ---- */
+  --color-navy: #1C1E32;
+  --color-navy-2: #262941;
+  --color-navy-3: #30334F;
+  --color-navy-text: #FFFFFF;
+  --color-navy-muted: #A0A3BD;
+  --color-navy-border: rgba(255, 255, 255, 0.08);
+
+  /* ---- Warna status ---- */
+  --color-success: #10B981;
+  --color-success-soft: #D1FAE5;
+  --color-success-text: #047857;
+  --color-warning: #F59E0B;
+  --color-warning-soft: #FEF3C7;
+  --color-warning-text: #B45309;
+  --color-danger: #EF4444;
+  --color-danger-soft: #FEE2E2;
+  --color-danger-text: #B91C1C;
+  --color-danger-hover: #DC2626;
+  --color-info: #3B82F6;
+  --color-info-soft: #DBEAFE;
+  --color-info-text: #1D4ED8;
+  --color-neutral: #6B7280;
+  --color-neutral-soft: #F3F4F6;
+  --color-neutral-text: #4B5563;
+
+  /* ---- Gradien ---- */
+  --gradient-primary: linear-gradient(135deg, #6D6BEF 0%, #5B5BD6 100%);
+  --gradient-primary-deep: linear-gradient(160deg, #7C7AF5 0%, #5B5BD6 55%, #4A48C8 100%);
+  --gradient-navy: linear-gradient(160deg, #262941 0%, #1C1E32 100%);
+  --glass-bg: rgba(255, 255, 255, 0.12);
+  --glass-bg-hover: rgba(255, 255, 255, 0.18);
+  --glass-border: rgba(255, 255, 255, 0.18);
+
+  /* ---- Radius ---- */
+  --radius-xs: 6px;
+  --radius-sm: 8px;
+  --radius-md: 12px;
+  --radius-lg: 16px;
+  --radius-xl: 20px;
+  --radius-2xl: 24px;
+  --radius-pill: 999px;
+
+  /* ---- Bayangan ---- */
+  --shadow-xs: 0 1px 2px rgba(28, 30, 50, 0.05);
+  --shadow-sm: 0 2px 6px rgba(28, 30, 50, 0.06);
+  --shadow-md: 0 4px 12px rgba(28, 30, 50, 0.08);
+  --shadow-card: 0 8px 24px rgba(28, 30, 50, 0.06);
+  --shadow-lg: 0 16px 40px rgba(28, 30, 50, 0.14);
+  --shadow-xl: 0 24px 64px rgba(28, 30, 50, 0.22);
+  --shadow-primary: 0 8px 20px rgba(91, 91, 214, 0.28);
+  --shadow-focus: 0 0 0 3px var(--color-primary-ring);
+
+  /* ---- Jarak ---- */
+  --space-0: 0;
+  --space-1: 4px;
+  --space-2: 8px;
+  --space-3: 12px;
+  --space-4: 16px;
+  --space-5: 20px;
+  --space-6: 24px;
+  --space-7: 32px;
+  --space-8: 40px;
+  --space-9: 56px;
+
+  /* ---- Layout ---- */
+  --topbar-h: 64px;
+  --container-max: 1440px;
+  --container-pad: 32px;
+  --card-pad: 24px;
+
+  /* ---- Gerakan ---- */
+  --transition: 150ms ease;
+  --transition-slow: 250ms ease;
+
+  /* ---- Layer ---- */
+  --z-dropdown: 40;
+  --z-topbar: 50;
+  --z-modal: 100;
+  --z-toast: 200;
+
+  color-scheme: light;
+}
+
+@media (max-width: 1279px) {
+  :root { --container-pad: 24px; }
+}
+@media (max-width: 767px) {
+  :root { --container-pad: 16px; --card-pad: 16px; --text-3xl: 24px; --text-4xl: 28px; }
+}

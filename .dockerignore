@@ -1,0 +1,9 @@
+node_modules
+storage
+.tmp
+.env
+.git
+*.local.txt
+*.local.md
+docs/research
+test

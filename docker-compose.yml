@@ -1,0 +1,16 @@
+# Alternatif deploy manual di VPS (tanpa Coolify):  docker compose up -d --build
+services:
+  glasspro-suite:
+    build: .
+    restart: unless-stopped
+    ports:
+      - "3000:3000"
+    env_file: .env
+    environment:
+      STORAGE_DIR: /app/storage
+      HOST: 0.0.0.0
+      PORT: 3000
+    volumes:
+      - glasspro-storage:/app/storage
+volumes:
+  glasspro-storage:

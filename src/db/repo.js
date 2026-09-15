@@ -420,3 +420,38 @@ module.exports = {
   startSyncLog, finishSyncLog, lastSync, listSyncLogs,
   logActivity, listActivity, ordersPerDay, transaction,
 };
+
+// ============================================================================
+// [ditambah oleh AGENT SYNC] fungsi kecil pendukung dashboard, detail order, dan scheduler sync.
+// ============================================================================
+
+// Jumlah order berstatus processed dengan processed_at >= ts (mis. "diproses hari ini").
+function countProcessedSince(ts) {
+  return getDb().prepare("SELECT COUNT(*) c FROM orders WHERE proc_status = 'processed' AND processed_at IS NOT NULL AND processed_at >= ?").get(ts || 0).c;
+}
+
+// Riwayat keikutsertaan satu order di semua run (terbaru dulu), digabung info run-nya.
+function listRunOrdersByOrder(orderSn) {
+  return getDb()
+    .prepare(`SELECT ro.*, r.part AS run_part, r.kind AS run_kind, r.status AS run_status, r.warehouse_filter AS run_warehouse_filter,
+      r.started_at AS run_started_at, r.finished_at AS run_finished_at, r.user_name AS run_user_name
+      FROM run_orders ro LEFT JOIN runs r ON r.id = ro.run_id WHERE ro.order_sn = ? ORDER BY ro.run_id DESC`)
+    .all(orderSn)
+    .map((r) => ({ ...r, flags: P(r.flags_json, {}) || {} }));
+}
+
+// Semua PDF yang memuat order tertentu (terbaru dulu).
+function listPdfsForOrder(orderSn) {
+  const like = `%${JSON.stringify(String(orderSn))}%`;
+  return getDb().prepare('SELECT * FROM pdfs WHERE order_sns_json LIKE ? ORDER BY id DESC').all(like)
+    .map(hydratePdf)
+    .filter((p) => Array.isArray(p.order_sns) && p.order_sns.includes(orderSn));
+}
+
+// Tandai sync_log yang masih 'running' (sisa proses yang mati mendadak) sebagai gagal. Mengembalikan jumlah baris.
+function markRunningSyncLogsFailed(reason) {
+  return getDb().prepare("UPDATE sync_log SET status = 'failed', finished_at = ?, error = ? WHERE status = 'running'")
+    .run(now(), reason || 'Sinkronisasi terputus (server dimulai ulang)').changes;
+}
+
+Object.assign(module.exports, { countProcessedSince, listRunOrdersByOrder, listPdfsForOrder, markRunningSyncLogsFailed });
