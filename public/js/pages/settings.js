@@ -58,6 +58,8 @@ function setDisabled(ctrl, on) {
 }
 function labelOptions(map, keys) { return (keys || Object.keys(map)).map((k) => ({ value: k, label: map[k] || k })); }
 function nowSec() { return Math.floor(Date.now() / 1000); }
+/** true bila halaman masih hidup dan `snap` adalah state yang sama (dipakai setelah await agar tidak menyentuh state halaman yang sudah ditinggalkan). */
+function alive(snap) { return !!state && state === snap; }
 function errMsg(e, fallback) { return api.errorMessage(e, fallback); }
 function metaList(key, fallback) { const m = state && state.settings && state.settings.meta; return (m && Array.isArray(m[key]) && m[key].length) ? m[key] : fallback; }
 
@@ -159,17 +161,21 @@ function sectionCard({ key, title, subtitle, icon, body, onSave, saveLabel = 'Si
       try { payload = onSave(); } catch (e) { err.show(errMsg(e, 'Data belum valid')); return; }
       if (payload === false || payload === null || payload === undefined) return;
       saveBtn.setLoading(true);
+      const snap = state;
       try {
         const r = await api.put('/api/settings', payload);
-        if (r && r.settings) { state.settings = { ...state.settings, ...r.settings }; store.settings = state.settings; }
+        if (r && r.settings) store.settings = r.settings;
+        if (!alive(snap)) return; // halaman sudah ditinggalkan saat menunggu server
+        if (r && r.settings) state.settings = { ...state.settings, ...r.settings };
         state.savedAt[key] = nowSec();
         toast.success(`${title} disimpan.`, { title: 'Pengaturan tersimpan' });
         if (afterSave) { try { await afterSave(r); } catch (e) { console.error(e); } }
-        rebuildSection(key);
+        if (alive(snap)) rebuildSection(key);
       } catch (e) {
         if (e && e.status === 401) return;
-        err.show(errMsg(e, 'Gagal menyimpan pengaturan'));
         toast.error(errMsg(e, 'Gagal menyimpan pengaturan'));
+        if (!alive(snap)) return;
+        err.show(errMsg(e, 'Gagal menyimpan pengaturan'));
         saveBtn.setLoading(false);
       }
     } });
@@ -283,9 +289,13 @@ function buildSection(key) {
 }
 
 async function reloadShopeeStatus() {
-  try { state.shopee = await api.get('/api/shopee/status'); } catch (e) { if (e && e.status !== 401) console.warn('status shopee gagal dimuat', e); }
+  const snap = state;
+  let st = null;
+  try { st = await api.get('/api/shopee/status'); } catch (e) { if (e && e.status !== 401) console.warn('status shopee gagal dimuat', e); }
+  if (!alive(snap)) return;
+  if (st) state.shopee = st;
   rebuildSection('shopee');
-  if (state && state.ctx && state.ctx.layout && state.ctx.layout.refreshSync) state.ctx.layout.refreshSync();
+  if (state.ctx && state.ctx.layout && state.ctx.layout.refreshSync) state.ctx.layout.refreshSync();
 }
 
 // ---------------------------------------------------------------------------
@@ -323,8 +333,8 @@ function shopRow(shop) {
   const now = nowSec();
   const exp = shop.access_expire_at;
   const expired = exp && exp < now;
-  const sub = el('div', { class: 'list-row-sub' },
-    `ID ${shop.shop_id}${shop.region ? ` · ${shop.region}` : ''} · token ${expired ? 'kadaluarsa' : 'berlaku s/d'} ${fmt.datetime(exp)}${exp ? ` (${fmt.relative(exp)})` : ''}`);
+  const tokenText = !exp ? 'masa berlaku token tidak diketahui' : `token ${expired ? 'kadaluarsa' : 'berlaku s/d'} ${fmt.datetime(exp)} (${fmt.relative(exp)})`;
+  const sub = el('div', { class: 'list-row-sub' }, `ID ${shop.shop_id}${shop.region ? ` · ${shop.region}` : ''} · ${tokenText}`);
   const errLine = shop.last_error ? el('div', { class: 'list-row-sub text-danger', style: { color: '#FCA5A5', whiteSpace: 'normal' } }, `Error terakhir: ${shop.last_error}`) : null;
   const actions = ro ? null : el('div', { class: 'row gap-2 wrap shop-row-actions' },
     c.button({ label: 'Refresh token', kind: 'glass', size: 'sm', icon: 'refresh', onClick: async (e, btn) => {
@@ -367,12 +377,14 @@ function shopsCard() {
   } });
   const testBtn = c.button({ label: 'Tes koneksi', kind: 'glass', size: 'sm', icon: 'wifi', onClick: async (e, btn) => {
     btn.setLoading(true); result.hidden = true;
+    const snap = state;
     try {
       const r = await api.post('/api/shopee/test', {});
       result.replaceChildren(c.alert({ tone: 'success', title: `Terhubung ke ${r.shop_name || `toko ${r.shop_id}`}`, text: `Latensi ${fmt.number(r.latency_ms)} ms · transport ${r.transport || '-'}${r.shop_status ? ` · status toko ${r.shop_status}` : ''}${r.region ? ` · ${r.region}` : ''}`, dismissible: true }));
       result.hidden = false;
       toast.success(`Koneksi OK: ${r.shop_name || r.shop_id} (${fmt.number(r.latency_ms)} ms)`);
-      state.shopee = await api.tryGet('/api/shopee/status', state.shopee).catch(() => state.shopee);
+      const st = await api.tryGet('/api/shopee/status', null).catch(() => null);
+      if (st && alive(snap)) state.shopee = st;
     } catch (err) {
       if (err && err.status === 401) return;
       result.replaceChildren(c.alert({ tone: 'danger', title: 'Tes koneksi gagal', text: errMsg(err, 'Tidak dapat menghubungi Shopee'), dismissible: true }));
@@ -382,9 +394,10 @@ function shopsCard() {
   const refreshBtn = c.iconButton({ icon: 'refresh', title: 'Muat ulang status', kind: 'glass', size: 'sm', onClick: () => reloadShopeeStatus() });
   const list = shops.length
     ? el('div', { class: 'list-panel' }, shops.map(shopRow))
-    : c.emptyState({ icon: 'store', size: 'sm', title: 'Belum ada toko terhubung', text: st ? 'Klik "Hubungkan toko Shopee" untuk otorisasi lewat Shopee Open Platform.' : 'Status toko tidak dapat dimuat dari server.' });
+    : c.emptyState({ icon: 'store', size: 'sm', title: 'Belum ada toko terhubung', text: !st ? 'Status toko tidak dapat dimuat dari server.' : state.ro ? 'Minta admin untuk menghubungkan toko lewat Shopee Open Platform.' : 'Klik "Hubungkan toko Shopee" untuk otorisasi lewat Shopee Open Platform.' });
+  // Staf hanya baca: boleh tes koneksi & muat ulang, tidak menghubungkan toko (konsisten dengan form tempel URL yang disembunyikan).
   return c.card({ tone: 'dark', icon: 'store', title: 'Toko terhubung', subtitle: shops.length ? `${shops.length} toko · sync menarik order dari toko berstatus Terhubung` : 'Otorisasi toko agar order bisa ditarik',
-    actions: [testBtn, connectBtn, refreshBtn], body: [list, result] });
+    actions: state.ro ? [testBtn, refreshBtn] : [testBtn, connectBtn, refreshBtn], body: [list, result] });
 }
 
 function manualConnectCard() {
@@ -468,7 +481,7 @@ function shopeeConfigCard() {
         'shopee.bridge_token': bridgeToken.value,
       };
     },
-    afterSave: async () => { try { state.shopee = await api.get('/api/shopee/status'); } catch { /* abaikan */ } },
+    afterSave: async () => { const snap = state; try { const st = await api.get('/api/shopee/status'); if (alive(snap)) state.shopee = st; } catch { /* abaikan */ } },
   });
 }
 
@@ -537,8 +550,13 @@ function buildWarehousesSection() {
   renderLive();
   const fetchBtn = c.button({ label: 'Ambil daftar gudang dari Shopee', kind: 'glass', size: 'sm', icon: 'download', onClick: async (e, btn) => {
     btn.setLoading(true);
-    try { state.liveWarehouses = await api.get('/api/shopee/warehouses'); renderLive(); toast.success(`${(state.liveWarehouses.warehouses || []).length} gudang diambil dari toko ${state.liveWarehouses.shop_id}.`); }
-    catch (err) { if (err && err.status !== 401) { liveBody.replaceChildren(c.alert({ tone: 'danger', title: 'Gagal mengambil gudang', text: errMsg(err) })); } }
+    const snap = state;
+    try {
+      const data = await api.get('/api/shopee/warehouses');
+      if (!alive(snap)) return;
+      state.liveWarehouses = data; renderLive();
+      toast.success(`${(data.warehouses || []).length} gudang diambil dari toko ${data.shop_id}.`);
+    } catch (err) { if (err && err.status !== 401) { liveBody.replaceChildren(c.alert({ tone: 'danger', title: 'Gagal mengambil gudang', text: errMsg(err) })); } }
     finally { btn.setLoading(false); }
   } });
   const cardLive = c.card({ tone: 'dark', icon: 'shopee', title: 'Gudang di Shopee (live)', subtitle: 'Daftar warehouse dari toko terhubung; petakan location_id ke gudang lokal.', actions: fetchBtn, body: liveBody });
@@ -760,7 +778,14 @@ function syncStatusCard() {
     ]));
   };
   renderBody();
-  const refresh = async () => { try { state.sync = await api.get('/api/sync/status'); } catch (e) { if (e && e.status !== 401) console.warn(e); } renderBody(); };
+  const refresh = async () => {
+    const snap = state;
+    let st = null;
+    try { st = await api.get('/api/sync/status'); } catch (e) { if (e && e.status !== 401) console.warn(e); }
+    if (!alive(snap)) return;
+    if (st) state.sync = st;
+    renderBody();
+  };
   const syncBtn = c.button({ label: 'Sync sekarang', kind: 'primary', size: 'sm', icon: 'sync', onClick: async (e, btn) => {
     btn.setLoading(true);
     try {
@@ -798,7 +823,7 @@ function buildSyncSection() {
       if (!statuses.length) { fStatuses.setError('Pilih minimal satu status'); return false; }
       return { sync: { enabled: enabled.checked, interval_minutes: interval.num(), lookback_days: lookback.num(), statuses, include_recent_updates: includeRecent.checked } };
     },
-    afterSave: async () => { try { state.sync = await api.get('/api/sync/status'); } catch { /* abaikan */ } if (state.ctx && state.ctx.layout && state.ctx.layout.refreshSync) state.ctx.layout.refreshSync(); },
+    afterSave: async () => { const snap = state; try { const st = await api.get('/api/sync/status'); if (alive(snap)) state.sync = st; } catch { /* abaikan */ } if (alive(snap) && state.ctx && state.ctx.layout && state.ctx.layout.refreshSync) state.ctx.layout.refreshSync(); },
   }));
 }
 
@@ -890,14 +915,16 @@ function buildUsersSection() {
 
 async function loadUsers() {
   if (!state) return;
+  const snap = state;
   try {
     const r = await api.get('/api/settings/users');
+    if (!alive(snap)) return; // halaman sudah ditinggalkan
     state.users = (r && r.users) || [];
     if (state.usersTable) state.usersTable.update({ rows: state.users });
   } catch (e) {
     if (e && e.status === 401) return;
-    if (state.usersTable) state.usersTable.update({ rows: [] });
     toast.error(errMsg(e, 'Gagal memuat pengguna'));
+    if (alive(snap) && state.usersTable) state.usersTable.update({ rows: [] });
   }
 }
 
