@@ -103,6 +103,16 @@ describe('classify.mapWarehouse', () => {
     snd.warehouses[0].location_ids = []; snd.warehouses[0].is_default = false;
     assert.equal(classify.mapWarehouse(['XXX'], snd), null, 'satu gudang kosong tapi bukan default → null');
   });
+  test('[review] ID lokasi tidak peka huruf besar/spasi & array diratakan', () => {
+    assert.equal(classify.mapWarehouse(['jkt-001'], S), 'jkt');
+    assert.equal(classify.mapWarehouse([' SBY-001 '], S), 'sby');
+    assert.equal(classify.mapWarehouse([['JKT-001']], S), 'jkt', 'product_location_id Shopee bisa array of string');
+    const sl = settingsMapped();
+    sl.warehouses[0].location_ids = ['jkt-001']; // user mengetik huruf kecil di setting
+    assert.equal(classify.mapWarehouse(['JKT-001'], sl), 'jkt');
+    assert.equal(classify.classifyOrder(order({ items: [item({ product_location_id: ['JKT-001'] })] }), S).warehouse_code, 'jkt');
+    assert.equal(classify.classifyOrder(order({ items: [item({ product_location_id: [] })] }), S).warehouse_code, null);
+  });
   test('item beda gudang → gudang item pertama + warning WAREHOUSE_MIXED', () => {
     const o = order({ items: [item({ product_location_id: 'SBY-001' }), item({ product_location_id: 'JKT-001', item_sku: 'HG-A' })] });
     const d = classify.classifyOrder(o, S);
@@ -154,6 +164,47 @@ describe('classify.classifyOrder', () => {
     assert.deepEqual(d.phone_type, { value: 'iPhone 15 Pro Max, Samsung S23', source: 'model_name', required: true, missing: false });
     const s2 = settingsMapped({ sku_rules: { ...S.sku_rules, require_phone_type: { mode: 'none', patterns: [] } } });
     assert.equal(classify.classifyOrder(order({ items: [item({ model_name: 'Universal' })] }), s2).phone_type.required, false);
+  });
+  test('[review] require_phone_type bentuk string & mode patterns', () => {
+    const sStr = settingsMapped({ sku_rules: { ...S.sku_rules, require_phone_type: 'none' } });
+    assert.equal(classify.classifyOrder(order({ items: [item({ model_name: 'Universal' })] }), sStr).phone_type.required, false);
+    const sPat = settingsMapped({ sku_rules: { ...S.sku_rules, require_phone_type: { mode: 'patterns', patterns: ['IP15PM'] } } });
+    const d = classify.classifyOrder(order({ items: [item({ model_name: 'Universal' }), item({ item_sku: 'HG-A', model_name: 'Universal' })] }), sPat);
+    assert.equal(d.items[0].phone_type_required, true, 'cocok pola → wajib');
+    assert.equal(d.items[1].phone_type_required, false, 'tidak cocok pola → tidak wajib');
+    assert.equal(d.phone_type.missing, true);
+  });
+  test('[review] override huruf besar & kurir kosong/spasi', () => {
+    const d = classify.classifyOrder(order({ overrides: { sku_category: 'HG', warehouse_code: 'SBY' } }), S);
+    assert.equal(d.sku_category, 'hg');
+    assert.equal(d.warehouse_code, 'sby');
+    assert.equal(classify.classifyOrder(order({ overrides: { warehouse_code: 'bdg' } }), S).warehouse_code, 'jkt', 'kode gudang tak dikenal diabaikan');
+    assert.equal(classify.classifyOrder(order({ shipping_carrier: '   ', checkout_shipping_carrier: 'SPX Instant' }), S).ship_type, 'instant');
+    assert.equal(classify.classifyOrder(order({ shipping_carrier: null, checkout_shipping_carrier: null }), S).ship_type, 'regular');
+  });
+  test('[review] tahan input rusak: order/item/setting null atau bentuk aneh', () => {
+    assert.doesNotThrow(() => classify.classifyOrder(null, null));
+    assert.equal(classify.classifyOrder(null, null).sku_category, 'review');
+    const d = classify.classifyOrder(order({ items: [null, item(), { qty: 'x' }, 'teks'] }), undefined);
+    assert.equal(d.items.length, 2, 'entri null / bukan objek dibuang');
+    assert.equal(d.items[1].category, null);
+    assert.equal(d.items[1].qty, 0);
+    assert.equal(d.items[0].category, 'tg', 'setting undefined → DEFAULTS');
+    assert.equal(d.sku_category, 'review', 'item objek tanpa SKU tetap → review');
+    assert.equal(classify.classifyOrder(order({ items: [null, item()] }), S).sku_category, 'tg', 'hanya null yang dibuang');
+    const weird = {
+      warehouses: null,
+      sku_rules: { match_mode: 'token', tg_patterns: null, hg_patterns: 'HG, HGX', phone_type_sources: 'note,model_name', generic_variation_words: null, require_phone_type: null },
+      shipping_rules: { instant_keywords: null },
+    };
+    const dw = classify.classifyOrder(order({ note: 'Vivo Y36', items: [item({ item_sku: 'HGX-1' })] }), weird);
+    assert.equal(dw.sku_category, 'hg', 'pola string dipisah koma');
+    assert.equal(dw.phone_type.value, 'Vivo Y36', 'urutan sumber dari string: note dulu');
+    assert.equal(dw.phone_type.source, 'note');
+    assert.equal(dw.ship_type, 'regular', 'instant_keywords null → semua regular');
+    assert.equal(classify.categorizeSku('TG-1', { sku_rules: { match_mode: 'regex', tg_patterns: ['('] } }), null, 'regex rusak diabaikan');
+    assert.equal(classify.mapWarehouse(null, { warehouses: [null, { code: 'jkt', location_ids: 'JKT-001, JKT-002' }] }), null);
+    assert.equal(classify.mapWarehouse('JKT-002', { warehouses: [null, { code: 'jkt', location_ids: 'JKT-001, JKT-002' }] }), 'jkt', 'location_ids string koma');
   });
 });
 
@@ -226,6 +277,37 @@ describe('validate.validateOrder', () => {
     assert.deepEqual(v.warnings.map((w) => w.code), ['DEADLINE_NEAR', 'NOTE_PRESENT', 'COD']);
     assert.deepEqual(codes(v), []);
   });
+  test('[review] needs_review hanya untuk order yang masih ikut antrian', () => {
+    const unk = [item({ item_sku: 'GP-UNIV' })];
+    // [BUG diperbaiki] order SHIPPED/CANCELLED/excluded/processed dengan SKU tak dikenal dulu ikut needs_review
+    // → reclassifyAll mengubah proc_status jadi 'review' dan membanjiri "Perlu Diperiksa".
+    assert.equal(run(order({ items: unk })).flags.needs_review, true);
+    assert.equal(run(order({ items: unk, order_status: 'SHIPPED' })).flags.needs_review, false);
+    assert.equal(run(order({ items: unk, order_status: 'COMPLETED' })).flags.needs_review, false);
+    assert.equal(run(order({ items: unk, order_status: 'CANCELLED' })).flags.needs_review, false);
+    assert.equal(run(order({ items: unk, order_status: 'IN_CANCEL' })).flags.needs_review, false);
+    assert.equal(run(order({ items: unk, overrides: { excluded: true } })).flags.needs_review, false);
+    assert.equal(run(order({ items: unk, proc_status: 'processed' })).flags.needs_review, false);
+    // hold-nya sendiri tetap tercatat supaya alasan tetap terlihat
+    assert.deepEqual(codes(run(order({ items: unk, order_status: 'SHIPPED' }))), ['STATUS_NOT_READY', 'SKU_UNKNOWN']);
+    // IN_PROGRESS / failed / PROCESSED (arranged) masih "hidup" → tetap perlu diperiksa
+    assert.equal(run(order({ items: unk, order_status: 'PROCESSED' })).flags.needs_review, true);
+    assert.equal(run(order({ items: unk, proc_status: 'failed' })).flags.needs_review, true);
+  });
+  test('[review] tahan input rusak: setting/ctx kosong, ship_by_date aneh, derived kosong', () => {
+    const o = order({ ship_by_date: 'abc' });
+    assert.doesNotThrow(() => validate.validateOrder(o, classify.classifyOrder(o, S), null));
+    assert.doesNotThrow(() => validate.validateOrder(o, classify.classifyOrder(o, S), S, undefined));
+    assert.equal(validate.validateOrder(o, classify.classifyOrder(o, S), S, { now }).flags.deadline_hours_left, null);
+    const v = validate.validateOrder(null, null, null, null);
+    assert.deepEqual(codes(v), ['STATUS_NOT_READY', 'SKU_UNKNOWN', 'WAREHOUSE_UNKNOWN']);
+    assert.equal(v.flags.needs_review, false, 'status tak diketahui → bukan antrian');
+    const vs = validate.validateOrder(order({ ship_by_date: String(now + 3 * 3600), items: [item({ model_name: 'Universal' })] }), classify.classifyOrder(order({ items: [item({ model_name: 'Universal' })] }), S), { cancel_rule: { threshold_hours: 'x' } }, { now });
+    assert.equal(vs.flags.tipe_belum_ditulis, true, 'ship_by_date string angka & threshold rusak → default 5 jam');
+    const vt = validate.validateOrder(order({ ship_by_date: now + 3 * 3600, items: [item({ model_name: 'Universal' })] }), classify.classifyOrder(order({ items: [item({ model_name: 'Universal' })] }), S), { cancel_rule: { threshold_hours: 2 } }, { now });
+    assert.deepEqual(codes(vt), ['PHONE_TYPE_MISSING'], 'threshold 2 jam: sisa 3 jam belum pengecualian');
+    assert.deepEqual(codes(run(order(), { activeRunOrderSns: ['SN-TEST'] })), [], 'activeRunOrderSns bukan Set diabaikan');
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -259,6 +341,16 @@ describe('part', () => {
     assert.equal(part.currentPart(custom, wib(11, 30)).part, 'p2');
     assert.equal(part.currentPart(custom, wib(10, 59)).part, 'p1');
   });
+  test('[review] zona waktu setting tidak valid / setting rusak tidak crash', () => {
+    // [BUG diperbaiki] app.timezone salah ketik → Intl melempar RangeError → preview 500
+    const bad = settingsMapped({ app: { timezone: 'Asia/Jakart' } });
+    assert.equal(part.currentPart(bad, wib(9, 30)).part, 'p1', 'jatuh ke WIB');
+    assert.equal(part.currentPart(bad, wib(13, 30)).part, 'p2');
+    assert.equal(part.currentPart(null, wib(15, 30)).part, 'p3');
+    assert.equal(part.currentPart({ parts: { p2: { start: 'abc' }, p3: null } }, wib(13, 30)).part, 'p2', 'jam tak valid → default');
+    assert.equal(part.currentPart(undefined).in_window !== undefined, true);
+    assert.deepEqual(part.allParts(S).map((w) => w.part), ['p1', 'p2', 'p3']);
+  });
 });
 
 describe('naming', () => {
@@ -271,6 +363,20 @@ describe('naming', () => {
     assert.equal(naming.groupKey({ ship_type: 'regular', sku_category: 'hg', warehouse_code: null }), 'regular-hg-all');
     assert.equal(naming.groupLabel({ ship_type: 'instant', sku_category: 'tg', warehouse_code: 'jkt' }, S), 'Instant/Same Day · TG · Jakarta');
     assert.equal(naming.groupLabel({ ship_type: 'regular', sku_category: 'mix', warehouse_code: 'all' }, S), 'Regular · Mix · Semua Gudang');
+  });
+  test('[review] nilai di luar kontrak dinormalkan (review→mix, huruf besar, null)', () => {
+    const ts = wib(9, 0);
+    // [BUG diperbaiki] sku_category 'review' (order dipaksa) menghasilkan '...-ins-review-jkt.pdf'
+    assert.equal(naming.pdfFileName({ ts, part: 'p1', ship_type: 'instant', sku_category: 'review', warehouse_code: 'jkt' }), '15092026-p1-ins-mix-jkt.pdf');
+    assert.equal(naming.pdfFileName({ ts, part: 'P2', ship_type: 'INSTANT', sku_category: 'TG', warehouse_code: 'JKT' }), '15092026-p2-ins-tg-jkt.pdf');
+    assert.equal(naming.pdfFileName({ ts, part: 'p1', ship_type: null, sku_category: null, warehouse_code: null }), '15092026-p1-reg-mix-all.pdf');
+    assert.equal(naming.pdfFileName({ ts, part: 'p1', ship_type: 'apa-ini', sku_category: 'apa-ini', warehouse_code: '' }), '15092026-p1-reg-mix-all.pdf');
+    assert.equal(naming.groupKey({ ship_type: 'instant', sku_category: 'review', warehouse_code: 'jkt' }), 'instant-mix-jkt', 'kunci grup konsisten dengan nama file');
+    assert.equal(naming.groupKey({ ship_type: 'INSTANT', sku_category: 'TG', warehouse_code: 'JKT' }), 'instant-tg-jkt');
+    assert.equal(naming.groupKey({}), 'regular-mix-all');
+    assert.equal(naming.pdfFileName(), `${time.ddmmyyyy(time.now())}-p1-reg-mix-all.pdf`, 'tanpa argumen tidak crash');
+    assert.equal(naming.warehouseLabel('sby', null), 'SBY');
+    assert.equal(naming.groupLabel({ ship_type: 'instant', sku_category: 'review', warehouse_code: 'jkt' }, S), 'Instant/Same Day · Perlu Diperiksa · Jakarta');
   });
 });
 
@@ -427,10 +533,19 @@ describe('preview (DB sementara)', () => {
     assert.equal(repo.getOrder('O5').proc_status, 'unprocessed', 'review → unprocessed');
     repo.setOverrides('O5', { sku_category: null, force_process: true });
     p = preview.buildPreview({ part: 'p1' }, { now });
-    const o5 = p.groups.flatMap((g) => g.orders).find((o) => o.order_sn === 'O5');
-    assert.ok(o5, 'force_process: masuk grup meski SKU_UNKNOWN');
-    assert.equal(o5.sku_category, 'review');
+    const g5 = p.groups.find((g) => g.orders.some((o) => o.order_sn === 'O5'));
+    assert.ok(g5, 'force_process: masuk grup meski SKU_UNKNOWN');
+    // [BUG diperbaiki] kategori 'review' yang diproses paksa dulu membuat grup/PDF 'instant-review-jkt'
+    // (di luar kontrak tg/hg/mix). Sekarang masuk ke 'mix'.
+    assert.equal(g5.key, 'instant-mix-jkt');
+    assert.equal(g5.sku_category, 'mix');
+    assert.equal(g5.file_name, `${time.ddmmyyyy(now)}-p1-ins-mix-jkt.pdf`);
+    const o5 = g5.orders.find((o) => o.order_sn === 'O5');
+    assert.equal(o5.sku_category, 'mix', 'ringkasan di grup memakai kategori efektif');
     assert.ok(o5.validation.warnings.some((w) => w.code === 'FORCED'));
+    assert.equal(p.totals.by_category.mix, 2, 'O4 (mix) + O5 (dipaksa)');
+    assert.equal(repo.getOrder('O5').sku_category, 'review', 'hasil klasifikasi di DB tetap jujur');
+    assert.equal(repo.getOrder('O5').proc_status, 'unprocessed');
     repo.setOverrides('O5', { force_process: null });
   });
 
@@ -441,11 +556,13 @@ describe('preview (DB sementara)', () => {
     assert.equal(repo.getOrder('O10').proc_status, 'review');
     assert.equal(repo.getOrder('O5').proc_status, 'review');
     assert.equal(repo.getOrder('O9').validation.holds[0].code, 'CANCELLED');
+    assert.equal(repo.getOrder('O9').validation.flags.needs_review, false, 'order batal tidak Perlu Diperiksa');
     assert.equal(repo.getOrder('O11').validation.holds.length, 0, 'tanpa part: tidak ada REGULAR_WAIT_P1 tersimpan');
     repo.setOverrides('O10', { warehouse_code: 'jkt' });
     preview.reclassifyAll({ now });
     assert.equal(repo.getOrder('O10').proc_status, 'unprocessed');
     assert.equal(repo.getOrder('O10').warehouse_code, 'jkt');
+    assert.doesNotThrow(() => preview.reclassifyAll(null), 'ctx null tidak crash');
   });
 
   test('toSummary', () => {
@@ -464,5 +581,79 @@ describe('preview (DB sementara)', () => {
     assert.equal(empty.deadline_hours_left, null);
     assert.deepEqual(empty.items, []);
     assert.equal(empty.validation.holds.length, 0);
+    // [review] input rusak: null, items berisi null / string JSON, phone_type & validation bukan objek
+    assert.doesNotThrow(() => preview.toSummary(null));
+    assert.doesNotThrow(() => preview.toSummary(undefined));
+    const weird = preview.toSummary({ order_sn: 'W', items: [null, { qty: '3' }], phone_type: 'x', validation: 'y', overrides: null, cod: 1, ship_by_date: 'abc' });
+    assert.equal(weird.qty_total, 3);
+    assert.equal(weird.item_count, 1, 'entri null dibuang');
+    assert.equal(weird.cod, true);
+    assert.deepEqual(weird.phone_type, { value: null, source: null, required: false, missing: false });
+    assert.deepEqual(weird.validation.holds, []);
+    assert.deepEqual(weird.overrides, {});
+    assert.equal(weird.deadline_hours_left, null);
+    assert.equal(preview.toSummary({ order_sn: 'S', items: 'bukan-array' }).item_count, 0);
   });
+
+  test('[review] validasi tersimpan bebas konteks: REGULAR_WAIT_P1 / IN_PROGRESS tidak masuk DB', () => {
+    const p3 = preview.buildPreview({ part: 'p3', warehouse: 'all' }, { now, activeRunOrderSns: new Set(['O1']) });
+    assert.deepEqual(p3.held.find((o) => o.order_sn === 'O11').reasons.map((r) => r.code), ['REGULAR_WAIT_P1'], 'preview tetap menahan');
+    assert.deepEqual(p3.held.find((o) => o.order_sn === 'O1').reasons.map((r) => r.code), ['IN_PROGRESS']);
+    assert.equal(repo.getOrder('O11').validation.holds.length, 0, 'DB tidak menyimpan REGULAR_WAIT_P1 (KPI dashboard "ditahan" tidak ikut membengkak)');
+    assert.equal(repo.getOrder('O1').validation.holds.length, 0, 'DB tidak menyimpan IN_PROGRESS dari run aktif');
+    assert.equal(repo.getOrder('O11').proc_status, 'unprocessed');
+    // Flag (tipe_belum_ditulis) tetap sama di DB dan di preview (dipakai process.js untuk stempel PDF)
+    const o7 = preview.buildPreview({ part: 'p1' }, { now }).groups[0].orders.find((o) => o.order_sn === 'O7');
+    assert.equal(o7.validation.flags.tipe_belum_ditulis, true);
+    assert.equal(repo.getOrder('O7').validation.flags.tipe_belum_ditulis, true);
+  });
+
+  test('[review] parameter part/gudang tidak peka huruf besar', () => {
+    const p = preview.buildPreview({ part: 'P3', warehouse: 'SBY' }, { now });
+    assert.equal(p.part, 'p3');
+    assert.equal(p.warehouse, 'sby');
+    assert.equal(preview.buildPreview({ part: 'AUTO', warehouse: '' }, { now: wib(9, 0) }).part, 'p1');
+    assert.equal(preview.buildPreview({ part: null, warehouse: null }, { now: wib(9, 0) }).warehouse, 'all');
+  });
+
+  test('[review] reclassifyAll: order SHIPPED/CANCELLED dengan SKU tak dikenal tidak jadi "review"', () => {
+    mk('O13', { order_status: 'SHIPPED' }, [item({ item_sku: 'GP-UNIV-PROMO', item_name: 'Promo' })]);
+    mk('O14', { order_status: 'IN_CANCEL' }, [item({ item_sku: 'GP-UNIV-PROMO', item_name: 'Promo' })]);
+    preview.reclassifyAll({ now });
+    assert.equal(repo.getOrder('O13').proc_status, 'unprocessed', 'SHIPPED cukup disembunyikan, bukan Perlu Diperiksa');
+    assert.equal(repo.getOrder('O13').validation.flags.needs_review, false);
+    assert.deepEqual(repo.getOrder('O13').validation.holds.map((h) => h.code), ['STATUS_NOT_READY', 'SKU_UNKNOWN']);
+    assert.equal(repo.getOrder('O14').proc_status, 'unprocessed');
+    assert.equal(repo.getOrder('O14').validation.flags.needs_review, false);
+    // Status kembali READY_TO_SHIP → baru masuk Perlu Diperiksa
+    mk('O13', { order_status: 'READY_TO_SHIP' }, [item({ item_sku: 'GP-UNIV-PROMO', item_name: 'Promo' })]);
+    preview.reclassifyAll({ now });
+    assert.equal(repo.getOrder('O13').proc_status, 'review');
+    // Dikeluarkan staf → keluar dari Perlu Diperiksa
+    repo.setOverrides('O13', { excluded: true });
+    preview.reclassifyAll({ now });
+    assert.equal(repo.getOrder('O13').proc_status, 'unprocessed');
+    const p = preview.buildPreview({ part: 'p1' }, { now });
+    assert.ok(p.excluded.some((o) => o.order_sn === 'O13'));
+    assert.ok(!p.review.some((o) => o.order_sn === 'O13'));
+  });
+
+  test('[review] buildPreview tahan setting/ctx minimal & item null', () => {
+    mk('O15', { shipping_carrier: null, checkout_shipping_carrier: 'SPX Instant' }, [null, item({ qty: '2', product_location_id: ['JKT-001'] })]);
+    const p = preview.buildPreview({}, { now });
+    const o15 = p.groups.flatMap((g) => g.orders).find((o) => o.order_sn === 'O15');
+    assert.ok(o15, 'item null diabaikan, product_location_id array diratakan');
+    assert.equal(o15.ship_type, 'instant');
+    assert.equal(o15.warehouse_code, 'jkt');
+    assert.equal(o15.qty_total, 2);
+    assert.equal(o15.item_count, 1, 'entri null dibuang, bukan dihitung sebagai item tanpa kode');
+    assert.equal(o15.sku_category, 'tg');
+    // settings tanpa process/sync/app/parts tidak boleh crash
+    const minimal = { warehouses: S.warehouses };
+    const p2 = preview.buildPreview({ part: 'p2' }, { now, settings: minimal });
+    assert.equal(p2.part, 'p2');
+    assert.ok(p2.groups.length > 0);
+    assert.equal(typeof p2.sync.stale, 'boolean');
+  });
+
 });

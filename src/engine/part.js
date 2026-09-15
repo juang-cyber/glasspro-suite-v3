@@ -32,10 +32,15 @@ function partWindow(settings, part) {
 
 // Part otomatis: jam WIB < mulai p2 → p1; < mulai p3 → p2; selain itu p3.
 // now: unix detik (default sekarang).
+// Menit sejak tengah malam; zona waktu setting yang tidak valid (mis. salah ketik) jatuh ke WIB, bukan crash.
+function minutesOfDaySafe(ts, tz) {
+  try { return time.minutesOfDay(ts, tz); } catch { return time.minutesOfDay(ts, time.DEFAULT_TZ); }
+}
+
 function currentPart(settings, now) {
   const ts = Number(now) || time.now();
   const tz = (settings && settings.app && settings.app.timezone) || time.DEFAULT_TZ;
-  const minutes = time.minutesOfDay(ts, tz);
+  const minutes = minutesOfDaySafe(ts, tz);
   const w1 = partWindow(settings, 'p1');
   const w2 = partWindow(settings, 'p2');
   const w3 = partWindow(settings, 'p3');

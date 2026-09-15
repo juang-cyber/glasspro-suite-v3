@@ -155,8 +155,12 @@
   .topbar { height: auto; }
   .topbar-inner { flex-wrap: wrap; height: auto; padding-top: 10px; padding-bottom: 10px; row-gap: 10px; }
   .brand-text { display: block; }
-  .nav { order: 3; width: 100%; margin: 0; justify-content: flex-start; }
+  .nav { order: 3; width: 100%; margin: 0; justify-content: space-between; overflow: visible; }
   .nav-item { padding: 0 12px; }
+  /* 5 item tidak muat dengan label di 390px → item non-aktif hanya ikon (label tetap ada untuk pembaca layar
+     lewat title), item aktif menampilkan labelnya. Tidak perlu gulir mendatar. */
+  .nav-item:not(.is-active) { width: 40px; padding: 0; justify-content: center; }
+  .nav-item:not(.is-active) > span { display: none; }
   .page-container { padding-top: var(--space-4); }
   .page-header { margin-bottom: var(--space-4); }
   .page-actions { width: 100%; }

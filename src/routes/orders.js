@@ -3,8 +3,8 @@
 const express = require('express');
 const repo = require('../db/repo');
 const { requireAdmin } = require('../middleware/auth');
-const { badRequest, notFound, wrap } = require('../util/errors');
-const { now: tnow, minutesOfDay, parseHHMM } = require('../util/time');
+const { badRequest, notFound, conflict, wrap } = require('../util/errors');
+const { now: tnow } = require('../util/time');
 const log = require('../util/log').make('orders');
 
 const router = express.Router();
@@ -55,34 +55,39 @@ function toSummary(order) {
   return fallbackSummary(order);
 }
 
-// Part otomatis (aturan kontrak) bila engine/part belum ada: < mulai p2 -> p1; < mulai p3 -> p2; selain itu p3.
-function autoPart(settings, now) {
-  const part = lazy('../engine/part', 'part');
-  if (part && typeof part.currentPart === 'function') {
-    try { return part.currentPart(settings, now).part; } catch (e) { log.warn(`currentPart gagal: ${e.message}`); }
+// Order yang sedang ikut run proses aktif (engine/process), kosong bila modul belum ada.
+function activeRunOrderSns() {
+  const proc = lazy('../engine/process', 'process');
+  if (proc && typeof proc.getActiveOrderSns === 'function') {
+    try { const s = proc.getActiveOrderSns(); if (s && typeof s.has === 'function') return s; } catch (e) { log.warn(`getActiveOrderSns gagal: ${e.message}`); }
   }
-  const parts = (settings && settings.parts) || {};
-  const mod = minutesOfDay(now);
-  const p2 = parseHHMM(parts.p2 && parts.p2.start) ?? 13 * 60;
-  const p3 = parseHHMM(parts.p3 && parts.p3.start) ?? 15 * 60;
-  if (mod < p2) return 'p1';
-  if (mod < p3) return 'p2';
-  return 'p3';
+  return new Set();
+}
+
+function isInProgress(order) {
+  return order.proc_status === 'processing' || activeRunOrderSns().has(order.order_sn);
 }
 
 // Klasifikasi + validasi ulang satu order, simpan, dan sesuaikan proc_status review <-> unprocessed.
+// Utamakan preview.classifyAndStore (satu sumber semantik dengan reclassifyAll); fallback classify+validate
+// bebas konteks (tanpa part / run aktif) — hold khusus part & IN_PROGRESS dihitung saat preview, bukan disimpan.
 function reclassifyOne(orderSn, settings) {
   const order = repo.getOrder(orderSn);
   if (!order) throw notFound('Order tidak ditemukan');
+  const now = tnow();
+  const preview = lazy('../engine/preview', 'preview');
+  if (preview && typeof preview.classifyAndStore === 'function') {
+    preview.classifyAndStore(order, settings, { now }, repo);
+    return repo.getOrder(orderSn);
+  }
   const classify = lazy('../engine/classify', 'classify');
   const validate = lazy('../engine/validate', 'validate');
   if (!classify || !validate) {
     log.warn('engine/classify atau engine/validate belum tersedia, klasifikasi ulang dilewati');
     return order;
   }
-  const now = tnow();
   const derived = classify.classifyOrder(order, settings) || {};
-  const validation = validate.validateOrder(order, derived, settings, { now, part: autoPart(settings, now), activeRunOrderSns: new Set() });
+  const validation = validate.validateOrder(order, derived, settings, { now });
   repo.setOrderDerived(orderSn, { ...derived, validation });
   if (ACTIVE_PROC.has(order.proc_status)) {
     const needsReview = !!(validation && validation.flags && validation.flags.needs_review);
@@ -178,6 +183,7 @@ router.patch('/:sn/overrides', wrap(async (req, res) => {
   const sn = req.params.sn;
   const before = repo.getOrder(sn);
   if (!before) throw notFound('Order tidak ditemukan');
+  if (isInProgress(before)) throw conflict('Order sedang diproses; tunggu sampai run selesai sebelum mengubah koreksi');
   const settings = repo.getSettings();
   const patch = validateOverrides(req.body, settings);
   repo.setOverrides(sn, patch);
@@ -191,6 +197,7 @@ router.post('/:sn/reset', requireAdmin, wrap(async (req, res) => {
   const sn = req.params.sn;
   const before = repo.getOrder(sn);
   if (!before) throw notFound('Order tidak ditemukan');
+  if (isInProgress(before)) throw conflict('Order sedang diproses di run yang masih berjalan; tidak bisa di-reset sekarang');
   repo.setOrderProc(sn, { proc_status: 'unprocessed', proc_run_id: null, processed_at: null, last_error: null, pdf_stale: 0 });
   const order = reclassifyOne(sn, repo.getSettings());
   repo.logActivity(req.user, 'order_reset', sn, { from: before.proc_status, run_id: before.proc_run_id, to: order.proc_status });

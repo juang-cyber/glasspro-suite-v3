@@ -136,17 +136,36 @@ export function find(path) {
   return null;
 }
 
+const missingPages = new Set();
+// Nama parameter detail sesuai kontrak (#/orders/:sn, #/history/:runId) untuk modul yang tidak mendaftar sendiri.
+const DETAIL_PARAM = { orders: 'sn', history: 'runId' };
+/**
+ * Cek apakah modul halaman ada di server (HEAD). Server SPA mengembalikan index.html (text/html) untuk
+ * file yang tidak ada, dan import() langsung akan mencatat error MIME di console — jadi dicek dulu.
+ */
+async function pageModuleExists(url) {
+  try {
+    const res = await fetch(url, { method: 'HEAD', cache: 'no-cache', credentials: 'same-origin' });
+    if (!res.ok) return false;
+    return /javascript|ecmascript/i.test(res.headers.get('content-type') || '');
+  } catch { return false; }
+}
+
 /** Cari route; jika belum ada, coba import dinamis ./pages/<nama>.js. */
 export async function resolve(path) {
   const hit = find(path);
   if (hit) return hit;
   const name = pageNameFromPath(path);
   if (!/^[a-z0-9_-]+$/i.test(name)) return null;
+  if (missingPages.has(name)) return null;
+  const url = new URL(`./pages/${name}.js`, import.meta.url).href;
   let mod = null;
   try {
-    mod = await import(`./pages/${name}.js`);
+    if (!(await pageModuleExists(url))) throw new Error('modul tidak ditemukan di server');
+    mod = await import(url);
   } catch (e) {
     console.warn(`[router] halaman "${name}" belum tersedia:`, e && e.message);
+    missingPages.add(name);
     return null;
   }
   const again = find(path);
@@ -155,7 +174,7 @@ export async function resolve(path) {
   if (page && typeof page.render === 'function') {
     const base = name === 'dashboard' ? '/' : `/${name}`;
     register(base, page, { name });
-    if (base !== '/') register(`${base}/:id`, page, { name });
+    if (base !== '/') register(`${base}/:${DETAIL_PARAM[name] || 'id'}`, page, { name });
     if (path.startsWith('/dev/')) register(`/dev/${name}`, page, { name });
     return find(path);
   }
@@ -188,8 +207,8 @@ export function setQuery(patch, opts = {}) {
   return navigate(buildHash(cur.path, q), { replace: opts.replace !== false });
 }
 
-/** Render ulang halaman saat ini. */
-export function refresh() { return handle(); }
+/** Render ulang halaman saat ini (modul halaman yang tadi tidak ditemukan dicek ulang ke server). */
+export function refresh() { missingPages.clear(); return handle(); }
 
 export function back(fallback = '#/') {
   if (history.length > 1) history.back(); else navigate(fallback);
@@ -221,7 +240,10 @@ async function handle() {
   const seq = ++renderSeq;
   const resolved = await resolve(parsed.path);
   if (seq !== renderSeq) return; // sudah ada navigasi baru
-  const route = { ...parsed, params: resolved ? resolved.params : {}, name: resolved ? resolved.route.name : pageNameFromPath(parsed.path), pattern: resolved ? resolved.route.pattern : null };
+  const params = resolved ? { ...resolved.params } : {};
+  // Alias umum: params.id selalu tersedia untuk halaman detail (#/orders/:sn → params.sn & params.id).
+  for (const k of ['sn', 'runId']) if (params[k] !== undefined && params.id === undefined) params.id = params[k];
+  const route = { ...parsed, params, name: resolved ? resolved.route.name : pageNameFromPath(parsed.path), pattern: resolved ? resolved.route.pattern : null };
 
   if (currentPage && typeof currentPage.destroy === 'function') {
     try { currentPage.destroy(); } catch (e) { console.error('[router] destroy error', e); }

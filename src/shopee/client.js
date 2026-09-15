@@ -14,8 +14,16 @@ const TOKEN_ERROR_CODES = new Set(['error_auth', 'invalid_access_token', 'invali
 const REFRESH_FATAL_CODES = new Set(['refresh_token_expired', 'shop_access_expired', 'error_auth', 'error_shop_refresh_token', 'shop_no_linked', 'shop_banned']);
 const RETRYABLE_CODES = new Set(['error_rate_limit', 'error_server', 'error_network']);
 
-// Error terstruktur dari Shopee / transport. `status` = status HTTP yang layak dikirim ke client (>= 400),
+const sleep = (ms) => new Promise((r) => { const t = setTimeout(r, ms); if (t.unref) t.unref(); });
+const suffix = (code) => String(code || '').split('.').pop();
+
+// Kode error Shopee yang disebabkan input pemakai (code/shop_id salah), bukan gangguan gateway -> HTTP 400.
+const CLIENT_INPUT_CODES = new Set(['invalid_code', 'invalid_shop_id', 'invalid_main_acount_id', 'invalid_main_account_id']);
+
+// Error terstruktur dari Shopee / transport. `status` = status HTTP yang layak dikirim ke client kita (>= 400),
 // `http_status` = status HTTP mentah dari Shopee (bisa 200 walau error).
+// Status mentah 401/403/404 dari Shopee TIDAK diteruskan apa adanya: 401 akan membuat SPA mengira sesi login
+// habis. Hanya 429/5xx (gangguan upstream) yang diteruskan; selain itu 502, atau 400 untuk kesalahan input.
 class ShopeeError extends Error {
   constructor(code, message, extra = {}) {
     super(message || code);
@@ -23,14 +31,12 @@ class ShopeeError extends Error {
     this.code = code || 'shopee_error';
     this.request_id = extra.request_id || null;
     this.http_status = extra.http_status ?? null;
-    this.status = extra.status || (extra.http_status >= 400 ? extra.http_status : 502);
+    const hs = Number(extra.http_status);
+    this.status = extra.status || (CLIENT_INPUT_CODES.has(suffix(this.code)) ? 400 : (hs === 429 || hs >= 500 ? hs : 502));
     this.details = extra.details;
     this.expose = true;
   }
 }
-
-const sleep = (ms) => new Promise((r) => { const t = setTimeout(r, ms); if (t.unref) t.unref(); });
-const suffix = (code) => String(code || '').split('.').pop();
 
 function isTokenError(json) {
   if (!json || !json.error) return false;
@@ -277,8 +283,16 @@ function createClient({ repo, fetchImpl, retryDelays } = {}) {
           }
           if (!isPublic && !refreshed && isTokenError(json)) {
             refreshed = true;
-            log.warn('token ditolak, coba refresh', { path: req.path, shop_id, error: errCode });
-            shop = await refreshToken(shop_id);
+            // Bila pemanggil lain sudah lebih dulu me-refresh (token di DB berbeda dari yang barusan dipakai),
+            // pakai token itu tanpa refresh ulang: refresh_token sekali pakai, jangan dirotasi dua kali.
+            const latest = repo.getShop(shop_id);
+            if (latest && latest.access_token && shop && latest.access_token !== shop.access_token) {
+              log.warn('token ditolak, memakai token yang sudah diperbarui pemanggil lain', { path: req.path, shop_id, error: errCode });
+              shop = latest;
+            } else {
+              log.warn('token ditolak, coba refresh', { path: req.path, shop_id, error: errCode });
+              shop = await refreshToken(shop_id);
+            }
             continue;
           }
           log.warn('shopee error', { path: req.path, error: errCode, message: json.message, request_id: json.request_id, http_status: result.status });
@@ -307,4 +321,4 @@ function createClient({ repo, fetchImpl, retryDelays } = {}) {
   return { call, ensureToken, refreshToken, readConfig, computeExpiry, ShopeeError };
 }
 
-module.exports = { createClient, ShopeeError, isTokenError, TOKEN_ERROR_CODES, REFRESH_FATAL_CODES, RETRYABLE_CODES };
+module.exports = { createClient, ShopeeError, isTokenError, TOKEN_ERROR_CODES, REFRESH_FATAL_CODES, RETRYABLE_CODES, CLIENT_INPUT_CODES };

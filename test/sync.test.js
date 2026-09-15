@@ -172,6 +172,76 @@ test('runSync: upsert, hitung created/updated, pdf stale, cancelled, restore', a
   assert.equal(st.last.id, r.sync_log_id);
 });
 
+test('runSync kedua: order processed yang sudah batal & tidak berubah tidak dilaporkan ulang', async () => {
+  const shopee = {
+    fetchOrders: async () => [
+      order('A-PROCESSED-CANCEL', { order_status: 'CANCELLED', update_time: NOW - 50 }), // sama persis dengan sync sebelumnya
+      order('B-PROCESSED-CHANGED', { items: [{ ...order('x').items[0], qty: 2 }] }), // sudah tersimpan qty 2
+    ],
+  };
+  const r = await sync.runSync({ trigger: 'auto' }, { shopee, preview: fakePreview(), now: NOW });
+  assert.equal(r.status, 'ok', r.error);
+  assert.equal(r.updated, 0);
+  assert.deepEqual(r.changed_processed, []);
+  assert.equal(repo.getOrder('A-PROCESSED-CANCEL').pdf_stale, true);
+  assert.equal(repo.getOrder('A-PROCESSED-CANCEL').proc_status, 'processed');
+
+  // Bila pdf_stale sempat direset (mis. PDF dibuat ulang), pembatalan ditandai lagi walau isi tidak berubah
+  repo.setOrderProc('A-PROCESSED-CANCEL', { pdf_stale: 0 });
+  const r2 = await sync.runSync({ trigger: 'auto' }, { shopee, preview: fakePreview(), now: NOW });
+  assert.deepEqual(r2.changed_processed, ['A-PROCESSED-CANCEL']);
+  assert.equal(repo.getOrder('A-PROCESSED-CANCEL').pdf_stale, true);
+});
+
+test('runSync: kategori/tipe HP per item order processed & cancelled tidak hilang setelah upsert', async () => {
+  // Order processed yang item-nya sudah diperkaya engine (category, phone_type)
+  repo.upsertOrder(order('P-ENRICHED'));
+  const p = repo.getOrder('P-ENRICHED');
+  repo.setOrderDerived('P-ENRICHED', {
+    warehouse_code: 'jkt', ship_type: 'instant', sku_category: 'tg',
+    phone_type: { value: 'iPhone 15 Pro Max', source: 'model_name', required: true, missing: false },
+    validation: { holds: [], warnings: [], flags: { tipe_belum_ditulis: false, deadline_hours_left: 24, needs_review: false } },
+    items: [{ ...p.items[0], category: 'tg', phone_type_required: true, phone_type: 'iPhone 15 Pro Max', phone_type_source: 'model_name' }],
+  });
+  repo.setOrderProc('P-ENRICHED', { proc_status: 'processed', processed_at: NOW - 100, proc_run_id: 1 });
+  // Order cancelled yang sebelumnya sudah diklasifikasi
+  repo.upsertOrder(order('Q-CANCELLED', { order_status: 'CANCELLED' }));
+  const q = repo.getOrder('Q-CANCELLED');
+  repo.setOrderDerived('Q-CANCELLED', { warehouse_code: 'jkt', ship_type: 'instant', sku_category: 'tg', items: [{ ...q.items[0], category: 'tg' }] });
+  repo.setOrderProc('Q-CANCELLED', { proc_status: 'cancelled' });
+
+  const shopee = {
+    fetchOrders: async () => [
+      order('P-ENRICHED', { order_status: 'SHIPPED', items: [{ ...order('x').items[0], price: 45000 }] }), // harga berubah (tidak material)
+      order('Q-CANCELLED', { order_status: 'CANCELLED' }),
+    ],
+  };
+  const r = await sync.runSync({ trigger: 'auto' }, { shopee, preview: fakePreview(), now: NOW });
+  assert.equal(r.status, 'ok', r.error);
+  const after = repo.getOrder('P-ENRICHED');
+  assert.equal(after.order_status, 'SHIPPED');
+  assert.equal(after.items[0].price, 45000); // data mentah terbaru tetap dipakai
+  assert.equal(after.items[0].category, 'tg'); // hasil engine dipertahankan
+  assert.equal(after.items[0].phone_type, 'iPhone 15 Pro Max');
+  assert.equal(after.sku_category, 'tg');
+  assert.equal(after.pdf_stale, false); // status SHIPPED bukan perubahan material
+  assert.equal(after.proc_status, 'processed');
+  assert.equal(repo.getOrder('Q-CANCELLED').items[0].category, 'tg');
+  assert.equal(repo.getOrder('Q-CANCELLED').proc_status, 'cancelled');
+});
+
+test('runSync: setting sync.statuses dipakai untuk rentang create_time', async () => {
+  const calls = [];
+  const shopee = { fetchOrders: async (args) => { calls.push(args); return []; } };
+  const base = repo.getSettings();
+  const settings = { ...base, sync: { ...base.sync, statuses: ['READY_TO_SHIP'], lookback_days: 1 } };
+  const r = await sync.runSync({ trigger: 'auto' }, { shopee, preview: fakePreview(), settings, now: NOW });
+  assert.equal(r.status, 'ok');
+  assert.deepEqual(calls[0].statuses, ['READY_TO_SHIP']);
+  assert.equal(calls[0].time_from, NOW - 86400);
+  assert.equal(calls[1].statuses, null); // rentang update_time selalu semua status
+});
+
 test('runSync: include_recent_updates=false hanya satu panggilan fetchOrders', async () => {
   const calls = [];
   const shopee = { fetchOrders: async (args) => { calls.push(args); return []; } };
@@ -281,6 +351,51 @@ test('scheduler: start/stop dan next_at', async () => {
   assert.equal(sync.intervalMinutes({ interval_minutes: 1 }), 1);
   assert.equal(sync.intervalMinutes({ interval_minutes: 'abc' }), 5);
   assert.equal(sync.intervalMinutes({ interval_minutes: 12.7 }), 12);
+});
+
+test('scheduler tick: jalan saat jatuh tempo (trigger auto), baca ulang setting tiap detak, diam saat nonaktif', async () => {
+  const calls = [];
+  const ctx = () => ({ shopee: { fetchOrders: async (a) => { calls.push(a); return []; } }, preview: fakePreview(), now: NOW });
+  const s = repo.getSettings().sync;
+  sync.startScheduler();
+  try {
+    // Baru mulai: sync pertama dijadwalkan 10 detik setelah start -> belum jatuh tempo
+    await sync._test.tick(ctx());
+    assert.equal(calls.length, 0);
+
+    // Paksa jatuh tempo -> runSync trigger 'auto' (dua rentang: create_time + update_time)
+    sync._test.setSchedulerStartedAt(NOW - 60);
+    const before = repo.listSyncLogs(200).length;
+    await sync._test.tick(ctx());
+    assert.equal(calls.length, 2);
+    const logs = repo.listSyncLogs(200);
+    assert.equal(logs.length, before + 1);
+    assert.equal(logs[0].trigger, 'auto');
+    assert.equal(logs[0].status, 'ok');
+
+    // Setelah jalan: berikutnya = selesai terakhir + interval; tick lagi tidak menjalankan apa pun
+    const st = sync.getStatus();
+    assert.ok(st.next_at >= NOW + 5 * 60 - 5 && st.next_at <= NOW + 5 * 60 + 60, `next_at=${st.next_at}`);
+    await sync._test.tick(ctx());
+    assert.equal(calls.length, 2);
+
+    // Interval diperkecil lewat setting -> detak berikutnya langsung memakai interval baru
+    repo.setSetting('sync', { ...s, interval_minutes: 1 });
+    sync._test.setLastRunAt(NOW - 61);
+    assert.equal(sync.getStatus().interval_minutes, 1);
+    await sync._test.tick(ctx());
+    assert.equal(calls.length, 4);
+
+    // Nonaktif -> tick diam walau sudah jatuh tempo
+    repo.setSetting('sync', { ...s, enabled: false });
+    sync._test.setLastRunAt(NOW - 3600);
+    await sync._test.tick(ctx());
+    assert.equal(calls.length, 4);
+    assert.equal(sync.getStatus().next_at, null);
+  } finally {
+    sync.stopScheduler();
+    repo.setSetting('sync', s);
+  }
 });
 
 test('startScheduler menandai sync_log yang menggantung sebagai failed', () => {

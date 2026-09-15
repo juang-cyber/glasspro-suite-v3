@@ -53,6 +53,9 @@ import { fmt } from './fmt.js';
 // DOM builder
 // ============================================================================
 const BOOL_PROPS = new Set(['disabled', 'checked', 'selected', 'hidden', 'readOnly', 'readonly', 'required', 'multiple', 'autofocus', 'open', 'indeterminate']);
+// Atribut URL yang tidak boleh berisi skema berbahaya (data order/pembeli bisa sampai ke sini lewat halaman).
+const URL_ATTRS = new Set(['href', 'src', 'action', 'formaction', 'xlink:href', 'poster', 'data']);
+function isUnsafeUrl(v) { const s = String(v ?? ''); return /^\s*(javascript|vbscript):/i.test(s) || /^\s*data:\s*text\/html/i.test(s); }
 
 function isPlainObject(v) { return v !== null && typeof v === 'object' && !(v instanceof Node) && !Array.isArray(v) && !(v instanceof RawHtml); }
 
@@ -67,7 +70,7 @@ export function append(parent, child) {
   return parent;
 }
 
-/** Terapkan atribut ke elemen (class/style/dataset/on*/html/text/ref/boolean props). */
+/** Terapkan atribut ke elemen (class, style, dataset, on<event>, html, text, ref, properti boolean). */
 export function setAttrs(node, attrs) {
   if (!attrs) return node;
   for (const [key, val] of Object.entries(attrs)) {
@@ -82,11 +85,13 @@ export function setAttrs(node, attrs) {
     if (key === 'html') { node.innerHTML = val === null ? '' : String(val); continue; }
     if (key === 'text') { node.textContent = val === null ? '' : String(val); continue; }
     if (key === 'ref') { if (typeof val === 'function') val(node); continue; }
-    if (key.startsWith('on') && typeof val === 'function') { node.addEventListener(key.slice(2).toLowerCase(), val); continue; }
+    // on<event>: hanya fungsi yang dipasang; string (mis. onclick="…") tidak pernah jadi atribut (cegah XSS).
+    if (/^on[a-z]/i.test(key)) { if (typeof val === 'function') node.addEventListener(key.slice(2).toLowerCase(), val); continue; }
     if (BOOL_PROPS.has(key)) { node[key === 'readonly' ? 'readOnly' : key] = !!val; continue; }
     if (key === 'value') { node.value = val === null ? '' : val; continue; }
     if (key === 'for') { node.htmlFor = val; continue; }
     if (val === null || val === false) continue;
+    if (URL_ATTRS.has(key) && isUnsafeUrl(val)) continue;
     node.setAttribute(key, val === true ? '' : String(val));
   }
   return node;
@@ -133,7 +138,8 @@ export function svgEl(tag, attrs, ...children) {
     if (v === null || v === undefined || v === false) continue;
     if (k === 'class') node.setAttribute('class', classNames(v));
     else if (k === 'style' && typeof v === 'object') Object.assign(node.style, v);
-    else if (k.startsWith('on') && typeof v === 'function') node.addEventListener(k.slice(2).toLowerCase(), v);
+    else if (/^on[a-z]/i.test(k)) { if (typeof v === 'function') node.addEventListener(k.slice(2).toLowerCase(), v); }
+    else if (URL_ATTRS.has(k) && isUnsafeUrl(v)) { /* abaikan URL berbahaya */ }
     else node.setAttribute(k, String(v));
   }
   for (const c of children) append(node, c);
@@ -299,7 +305,7 @@ const ICON_PATHS = {
   sparkles: '<path d="m12 3 1.9 5.1L19 10l-5.1 1.9L12 17l-1.9-5.1L5 10l5.1-1.9z"/><path d="M19 17v4"/><path d="M17 19h4"/><path d="M5 3v3"/><path d="M3.5 4.5h3"/>',
   sun: '<circle cx="12" cy="12" r="4"/><path d="M12 2v2"/><path d="M12 20v2"/><path d="m4.9 4.9 1.4 1.4"/><path d="m17.7 17.7 1.4 1.4"/><path d="M2 12h2"/><path d="M20 12h2"/><path d="m6.3 17.7-1.4 1.4"/><path d="m19.1 4.9-1.4 1.4"/>',
   moon: '<path d="M21 12.8A9 9 0 1 1 11.2 3a7 7 0 0 0 9.8 9.8z"/>',
-  logo: '<rect x="3" y="3" width="18" height="18" rx="4"/><path d="M8 15.5V8.5h4.5a2 2 0 0 1 0 4H8"/><path d="m12 12.5 4 3"/>',
+  logo: '<rect x="3" y="3" width="18" height="18" rx="4"/><path d="M14.8 9.2A4 4 0 1 0 16 12h-4"/>',
 };
 
 /** Buat SVG ikon. opts: { size=20, class, strokeWidth=1.75, title } */
@@ -308,7 +314,7 @@ export function icon(name, opts = {}) {
   const paths = ICON_PATHS[name];
   const svg = svgEl('svg', {
     xmlns: SVG_NS, viewBox: '0 0 24 24', width: size, height: size, fill: 'none', stroke: 'currentColor',
-    'stroke-width': strokeWidth, 'stroke-linecap': 'round', 'stroke-linejoin': 'round', class: classNames('icon', `icon-${name}`, cls), 'aria-hidden': title ? null : 'true', role: title ? 'img' : null,
+    'stroke-width': strokeWidth, 'stroke-linecap': 'round', 'stroke-linejoin': 'round', class: classNames('icon', `ic-${name}`, cls), 'aria-hidden': title ? null : 'true', role: title ? 'img' : null,
   });
   if (title) svg.appendChild(svgEl('title', null, title));
   svg.innerHTML += paths || ICON_PATHS.help;
@@ -330,10 +336,30 @@ export function resolveIcon(ic, opts) {
   if (ic instanceof Node) return ic.isConnected ? ic.cloneNode(true) : ic;
   if (typeof ic === 'string') {
     if (ICON_PATHS[ic]) return icon(ic, opts);
-    if (ic.trim().startsWith('<')) { const t = document.createElement('template'); t.innerHTML = ic.trim(); return t.content.firstChild; }
+    if (ic.trim().startsWith('<')) return sanitizedSvg(ic.trim());
     return document.createTextNode(ic);
   }
   return null;
+}
+
+/**
+ * String markup untuk ikon hanya diterima jika berupa <svg> inline; elemen script/foreignObject, atribut on<event>,
+ * dan href "javascript:" dibuang agar data dari luar (mis. nama produk yang salah dikira ikon) tidak bisa menyuntikkan skrip.
+ * Markup selain <svg> dirender sebagai teks biasa.
+ */
+function sanitizedSvg(markup) {
+  if (!/^<svg[\s>]/i.test(markup)) return document.createTextNode(markup);
+  const t = document.createElement('template');
+  t.innerHTML = markup;
+  const svg = t.content.firstElementChild;
+  if (!svg || svg.tagName.toLowerCase() !== 'svg') return null;
+  for (const bad of svg.querySelectorAll('script, foreignObject, iframe, object, embed')) bad.remove();
+  for (const n of [svg, ...svg.querySelectorAll('*')]) {
+    for (const a of [...n.attributes]) {
+      if (/^on/i.test(a.name) || (URL_ATTRS.has(a.name) && isUnsafeUrl(a.value))) n.removeAttribute(a.name);
+    }
+  }
+  return svg;
 }
 
 // ============================================================================
@@ -767,13 +793,13 @@ export function table(opts = {}) {
   const tbody = el('tbody');
   const thead = el('thead', el('tr', columns.map((c) => el('th', { class: classNames(c.align && `align-${c.align}`, c.headerClass), style: c.width ? { width: typeof c.width === 'number' ? `${c.width}px` : c.width } : null, scope: 'col' }, c.label ?? ''))));
   const tbl = el('table', { class: classNames('table', compact && 'table-compact') }, thead, tbody);
-  const wrap = el('div', { class: classNames('table-wrap', className), style: maxHeight ? { maxHeight: typeof maxHeight === 'number' ? `${maxHeight}px` : maxHeight, overflowY: 'auto' } : null }, tbl);
+  const wrap = el('div', { class: classNames('table-wrap', maxHeight && 'table-wrap-scroll', className), style: maxHeight ? { maxHeight: typeof maxHeight === 'number' ? `${maxHeight}px` : maxHeight, overflowY: 'auto' } : null }, tbl);
   if (footer) wrap.appendChild(el('div', { class: 'table-footer' }, footer));
   let selected = opts.selectedKey ?? null;
   wrap.rows = [];
   const renderRows = (rows) => {
     tbody.replaceChildren();
-    wrap.rows = Array.isArray(rows) ? rows : [];
+    wrap.rows = (Array.isArray(rows) ? rows : []).filter((r) => r !== null && r !== undefined);
     if (!wrap.rows.length) {
       const content = empty === undefined || typeof empty === 'string' ? emptyState({ title: empty || 'Tidak ada data', size: 'sm', icon: 'inbox' }) : empty instanceof Node ? empty : emptyState({ size: 'sm', ...empty });
       tbody.appendChild(el('tr', { class: 'table-empty' }, el('td', { colspan: Math.max(1, columns.length) }, content)));
@@ -996,7 +1022,7 @@ export function dropdown(opts = {}) {
   const build = () => {
     menu.replaceChildren();
     if (header) menu.appendChild(header instanceof Node ? header : el('div', { class: 'menu-header' }, el('div', { class: 'menu-header-title' }, header.title), header.sub ? el('div', { class: 'menu-header-sub' }, header.sub) : null));
-    const list = typeof items === 'function' ? items() : items;
+    const list = (typeof items === 'function' ? items() : items) || [];
     for (const it of list) {
       if (!it) continue;
       if (it.divider) { menu.appendChild(el('div', { class: 'menu-divider' })); continue; }
@@ -1013,7 +1039,9 @@ export function dropdown(opts = {}) {
   node.toggle = () => (menu.hidden ? node.open() : node.close());
   node.isOpen = () => !menu.hidden;
   trigger.setAttribute('aria-haspopup', 'true');
-  trigger.addEventListener('click', (e) => { e.stopPropagation(); node.toggle(); });
+  // Tanpa stopPropagation: klik pemicu tetap sampai ke document sehingga dropdown lain yang sedang terbuka ikut menutup
+  // (listener document milik dropdown ini sendiri baru dipasang setelah klik selesai, lihat open()).
+  trigger.addEventListener('click', () => node.toggle());
   return node;
 }
 
@@ -1047,8 +1075,9 @@ export function listPanel(opts = {}) {
   };
   node.update = (items = []) => {
     node.replaceChildren();
-    if (!items.length) { node.appendChild(empty instanceof Node ? empty : emptyState({ size: 'sm', title: typeof empty === 'string' ? empty : 'Tidak ada data', ...(typeof empty === 'object' && empty ? empty : {}) })); return node; }
-    for (const it of items) node.appendChild(rowOf(it));
+    const list = (Array.isArray(items) ? items : []).filter((it) => it && typeof it === 'object');
+    if (!list.length) { node.appendChild(empty instanceof Node ? empty : emptyState({ size: 'sm', title: typeof empty === 'string' ? empty : 'Tidak ada data', ...(typeof empty === 'object' && empty ? empty : {}) })); return node; }
+    for (const it of list) node.appendChild(rowOf(it));
     return node;
   };
   node.setSelected = (key) => { selected = key; for (const r of node.querySelectorAll('.list-row')) { const on = key !== null && key !== undefined && r.dataset.key === String(key); r.classList.toggle('is-selected', on); if (onSelect) r.setAttribute('aria-selected', String(on)); } return node; };
@@ -1068,7 +1097,7 @@ export function glassTile(opts = {}) {
 /** kv([{ label, value, mono? }] | [[label, value]], { stacked }) → <dl class="kv"> */
 export function kv(rows = [], opts = {}) {
   const node = el('dl', { class: classNames('kv', opts.stacked && 'kv-stacked', opts.className) });
-  for (const r of rows) {
+  for (const r of (Array.isArray(rows) ? rows : [])) {
     if (!r) continue;
     const item = Array.isArray(r) ? { label: r[0], value: r[1] } : r;
     node.appendChild(el('dt', item.label));
@@ -1143,7 +1172,8 @@ export function link(opts = {}) {
  */
 export function timeline(items = [], opts = {}) {
   const node = el('div', { class: classNames('timeline', opts.className) });
-  for (const it of items) {
+  for (const it of (Array.isArray(items) ? items : [])) {
+    if (!it) continue;
     node.appendChild(el('div', { class: 'timeline-item' },
       el('div', { class: classNames('timeline-dot', it.tone && `tone-${it.tone}`) }, resolveIcon(it.icon || 'check', { size: 11 })),
       el('div', { class: 'flex-1 min-w-0' }, el('div', { class: 'timeline-title' }, it.title), it.sub ? el('div', { class: 'timeline-sub' }, it.sub) : null),

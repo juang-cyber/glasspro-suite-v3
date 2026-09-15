@@ -29,6 +29,8 @@ const WARNING_MESSAGES = {
 };
 
 const DEADLINE_NEAR_HOURS = 12;
+// Hold yang menandakan order tidak lagi ikut antrian proses (needs_review tidak berlaku).
+const NOT_IN_PLAY_HOLDS = ['EXCLUDED', 'CANCELLED', 'STATUS_NOT_READY', 'ALREADY_PROCESSED'];
 
 function round2(n) { return Math.round(n * 100) / 100; }
 
@@ -49,10 +51,11 @@ function hasWarning(validation, code) {
 
 // validateOrder(order, derived, settings, ctx) -> { holds, warnings, flags }
 // ctx: { now, part:'p1'|'p2'|'p3'|null, activeRunOrderSns:Set }
-function validateOrder(order, derived, settings, ctx = {}) {
+function validateOrder(order, derived, settings, ctx) {
   const o = order || {};
   const d = derived || {};
   const s = settings || {};
+  if (!ctx || typeof ctx !== 'object') ctx = {};
   const now = Number(ctx.now) || time.now();
   const overrides = (o.overrides && typeof o.overrides === 'object') ? o.overrides : {};
   const cancelRule = { ...DEFAULTS.cancel_rule, ...(s.cancel_rule || {}) };
@@ -111,7 +114,11 @@ function validateOrder(order, derived, settings, ctx = {}) {
   if (o.cod) addWarn('COD');
   if (d.warehouse_mixed) addWarn('WAREHOUSE_MIXED');
 
-  flags.needs_review = holds.some((h) => h.code === 'SKU_UNKNOWN' || h.code === 'WAREHOUSE_UNKNOWN');
+  // "Perlu Diperiksa" hanya relevan untuk order yang masih hidup di antrian. Order batal / status belum siap
+  // (SHIPPED, COMPLETED, UNPAID, ...) / dikeluarkan staf / sudah diproses tidak boleh berubah jadi proc_status 'review'
+  // hanya karena SKU/gudang tidak dikenali (kontrak: SHIPPED yang tidak diproses lewat app cukup disembunyikan).
+  const inPlay = !holds.some((h) => NOT_IN_PLAY_HOLDS.includes(h.code));
+  flags.needs_review = inPlay && holds.some((h) => h.code === 'SKU_UNKNOWN' || h.code === 'WAREHOUSE_UNKNOWN');
   return { holds, warnings, flags };
 }
 

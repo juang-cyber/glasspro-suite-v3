@@ -38,10 +38,13 @@ function createAuth({ repo, client, shop }) {
   // Tukar code dari callback menjadi token. Untuk main_account_id: semua shop_id_list diupsert lalu direfresh satu per satu.
   async function exchangeCode({ code, shop_id, main_account_id } = {}) {
     if (!code) throw new ShopeeError('invalid_code', 'Kode otorisasi (code) kosong', { status: 400 });
-    const sid = shop_id !== undefined && shop_id !== null && shop_id !== '' ? Number(shop_id) : null;
-    const mid = main_account_id !== undefined && main_account_id !== null && main_account_id !== '' ? Number(main_account_id) : null;
-    if (!sid && !mid) throw new ShopeeError('shop_required', 'shop_id atau main_account_id wajib diisi', { status: 400 });
-    if ((sid && !Number.isFinite(sid)) || (mid && !Number.isFinite(mid))) throw new ShopeeError('bad_request', 'shop_id / main_account_id harus angka', { status: 400 });
+    const given = (v) => v !== undefined && v !== null && String(v).trim() !== '';
+    const sid = given(shop_id) ? Number(shop_id) : null;
+    const mid = given(main_account_id) ? Number(main_account_id) : null;
+    if (sid === null && mid === null) throw new ShopeeError('shop_required', 'shop_id atau main_account_id wajib diisi', { status: 400 });
+    if ((sid !== null && !(Number.isInteger(sid) && sid > 0)) || (mid !== null && !(Number.isInteger(mid) && mid > 0))) {
+      throw new ShopeeError('bad_request', 'shop_id / main_account_id harus berupa angka positif', { status: 400 });
+    }
     const cfg = client.readConfig();
     const body = { code: String(code), partner_id: cfg.partner_id };
     if (sid) body.shop_id = sid;

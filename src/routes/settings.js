@@ -221,7 +221,7 @@ const VALIDATORS = {
 
 function validateSettingsPatch(body, current) {
   if (!isObj(body)) throw badRequest('Isi permintaan harus berupa objek { key: value }');
-  const keys = Object.keys(body);
+  const keys = Object.keys(body).filter((k) => k !== 'meta'); // `meta` hanya info dari GET, bukan pengaturan
   if (!keys.length) throw badRequest('Tidak ada pengaturan yang dikirim');
   const unknown = keys.filter((k) => !(k in DEFAULTS));
   if (unknown.length) throw badRequest(`Key pengaturan tidak dikenal: ${unknown.join(', ')}`, { unknown });

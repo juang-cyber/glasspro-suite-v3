@@ -114,7 +114,8 @@ export function datetimeShort(ts) {
 export function relative(ts, nowTs) {
   const d = toDate(ts);
   if (!d) return '';
-  const nowMs = nowTs !== undefined ? toDate(nowTs).getTime() : Date.now();
+  const nowD = nowTs !== undefined && nowTs !== null ? toDate(nowTs) : null;
+  const nowMs = nowD ? nowD.getTime() : Date.now();
   const diff = Math.round((nowMs - d.getTime()) / 1000); // positif = masa lalu
   const abs = Math.abs(diff);
   if (abs < 45) return 'baru saja';

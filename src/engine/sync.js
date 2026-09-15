@@ -107,6 +107,35 @@ function materiallyChanged(row, prev) {
   return materialSignature(effectiveRow(row, prev)) !== materialSignature(prev);
 }
 
+// Field item hasil engine (classify) yang ikut tersimpan di items_json.
+const ENRICH_KEYS = ['category', 'category_conflict', 'phone_type_required', 'phone_type', 'phone_type_source'];
+const itemKey = (it) => `${nv(it.order_item_id) ?? nv(it.item_id) ?? ''}|${nv(it.model_id) ?? ''}`;
+
+// repo.upsertOrder menimpa items_json dengan item mentah Shopee, sedangkan reclassifyAll sengaja
+// melewati order processed/cancelled. Agar kategori/tipe HP per item tidak hilang dari detail order
+// & product list, salin kembali field hasil engine dari item lama ke item baru (dicocokkan per item).
+// Mengembalikan true bila ada yang dipulihkan.
+function preserveItemEnrichment(repo, sn, newItems, prev) {
+  const prevItems = Array.isArray(prev.items) ? prev.items : [];
+  if (!prevItems.some((it) => it && ENRICH_KEYS.some((k) => it[k] !== undefined))) return false;
+  const byKey = new Map(prevItems.filter(Boolean).map((it) => [itemKey(it), it]));
+  let restored = false;
+  const items = (Array.isArray(newItems) ? newItems : []).map((it) => {
+    if (!it) return it;
+    const old = byKey.get(itemKey(it));
+    if (!old) return it;
+    const out = { ...it };
+    for (const k of ENRICH_KEYS) if (out[k] === undefined && old[k] !== undefined) { out[k] = old[k]; restored = true; }
+    return out;
+  });
+  if (!restored) return false;
+  repo.setOrderDerived(sn, {
+    warehouse_code: prev.warehouse_code, ship_type: prev.ship_type, sku_category: prev.sku_category,
+    phone_type: prev.phone_type, validation: prev.validation, items,
+  });
+  return true;
+}
+
 // ---------- sync per toko ----------
 async function fetchShopOrders({ shopee, shop, settings, now }) {
   const syncSet = settings.sync || {};
@@ -149,9 +178,14 @@ function applyOrders({ repo, shop, rows }) {
 
       const prev = res.previous || null;
       const cancelledNow = CANCEL_STATUSES.has(String(row.order_status || '').toUpperCase());
+      if (prev && (prev.proc_status === 'processed' || prev.proc_status === 'cancelled')) {
+        // Order ini dilewati reclassifyAll -> jaga kategori/tipe HP per item hasil engine
+        preserveItemEnrichment(repo, sn, res.order ? res.order.items : row.items, prev);
+      }
       if (prev && prev.proc_status === 'processed') {
-        // Sudah ada PDF: status proses tetap 'processed', tapi PDF ditandai usang bila batal / isi berubah
-        if (cancelledNow) out.stale_cancelled.push(sn);
+        // Sudah ada PDF: status proses tetap 'processed', tapi PDF ditandai usang bila batal / isi berubah.
+        // Batal yang sudah pernah ditandai (pdf_stale) tidak dilaporkan ulang tiap sync.
+        if (cancelledNow) { if (res.changed || !prev.pdf_stale) out.stale_cancelled.push(sn); }
         else if (res.changed && materiallyChanged(row, prev)) out.stale_changed.push(sn);
       } else if (cancelledNow) {
         if (!prev || (prev.proc_status !== 'cancelled' && prev.proc_status !== 'processing')) {
@@ -314,17 +348,18 @@ function getStatus() {
   };
 }
 
-async function tick() {
+// Detak scheduler: setting (enabled/interval) dibaca ulang tiap detak. ctx hanya dipakai test.
+async function tick(ctx = {}) {
   try {
     if (running) return;
-    const repo = require('../db/repo');
+    const repo = ctx.repo || require('../db/repo');
     const settings = repo.getSettings();
     const syncSet = settings.sync || {};
     if (syncSet.enabled === false) return;
     if (!repo.getPrimaryShop('shopee')) return;
     const due = nextRunAt(settings, true);
     if (due === null || tnow() < due) return;
-    await runSync({ trigger: 'auto' });
+    await runSync({ trigger: 'auto' }, ctx);
   } catch (e) {
     log.error('scheduler error', e);
   }
@@ -360,4 +395,6 @@ module.exports = {
   runSync, getStatus, startScheduler, stopScheduler, isRunning,
   // diekspor untuk test/unit kecil
   summarizeError, materiallyChanged, intervalMinutes,
+  // hook khusus test scheduler (jangan dipakai modul lain)
+  _test: { tick, setSchedulerStartedAt: (ts) => { schedulerStartedAt = ts; }, setLastRunAt: (ts) => { lastRunAt = ts; } },
 };

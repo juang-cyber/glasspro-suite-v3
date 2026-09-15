@@ -80,6 +80,72 @@ describe('pdf.buildLabelsPdf', () => {
     assert.ok(fontDict, 'resource font ada di halaman label (stempel digambar)');
   });
 
+  test('stempel benar-benar tergambar: SN + marketplace di tiap halaman, TIPE BELUM DITULIS hanya bila diflag, rotasi 90° diikuti', async () => {
+    const zlib = require('zlib');
+    const { PDFArray, PDFName } = require('pdf-lib');
+    // Content stream halaman (inflate bila FlateDecode). Stempel ditambahkan pdf-lib sebagai stream TERAKHIR
+    // (stream asli label tetap utuh di depannya).
+    const pageStreams = (doc, page) => {
+      const c = page.node.Contents();
+      const refs = c instanceof PDFArray ? c.asArray() : [c];
+      return refs.map((ref) => {
+        const stream = doc.context.lookup(ref);
+        let bytes = Buffer.from(stream.contents);
+        const filter = stream.dict.get(PDFName.of('Filter'));
+        if (filter && String(filter).includes('FlateDecode')) bytes = zlib.inflateSync(bytes);
+        return bytes.toString('latin1');
+      });
+    };
+    const pageContent = (doc, page) => pageStreams(doc, page).join('\n');
+    const stampContent = (doc, page) => { const s = pageStreams(doc, page); return s[s.length - 1]; };
+    const hex = (s) => Buffer.from(s, 'latin1').toString('hex');
+    const has = (content, text) => content.includes(`(${text})`) || content.toLowerCase().includes(hex(text));
+    // Matriks teks (Tm): kumpulkan (a,b,c,d) yang dipakai
+    const textMatrices = (content) => [...content.matchAll(/(-?[\d.]+(?:e-?\d+)?) (-?[\d.]+(?:e-?\d+)?) (-?[\d.]+(?:e-?\d+)?) (-?[\d.]+(?:e-?\d+)?) (-?[\d.]+(?:e-?\d+)?) (-?[\d.]+(?:e-?\d+)?) Tm/g)]
+      .map((m) => m.slice(1, 5).map(Number));
+
+    const res = await pdf.buildLabelsPdf({
+      cover,
+      labels: [
+        { order_sn: 'SN-TIPE', marketplace: 'shopee', buffer: await fakeLabel('SN-TIPE'), flags: { tipe_belum_ditulis: true } },
+        { order_sn: 'SN-ROT', marketplace: 'shopee', buffer: await fakeLabel('SN-ROT', { rotate: 90 }), flags: {} },
+        { order_sn: 'SN-180', marketplace: 'tiktok', buffer: await fakeLabel('SN-180', { rotate: 180 }), flags: { tipe_belum_ditulis: false } },
+      ],
+    });
+    const doc = await PDFDocument.load(res.bytes);
+    const pages = doc.getPages();
+    assert.equal(pages.length, 4);
+    const cTipe = pageContent(doc, pages[1]);
+    const cRot = pageContent(doc, pages[2]);
+    const c180 = pageContent(doc, pages[3]);
+    // konten label asli tetap ada (stream asli tidak disentuh, stempel ditambahkan sebagai stream baru)
+    assert.ok(has(cTipe, 'LABEL SN-TIPE hal 1'), 'isi label asli dipertahankan');
+    assert.ok(pageStreams(doc, pages[1]).length >= 2, 'stempel berupa stream terpisah');
+    assert.ok(!has(stampContent(doc, pages[1]), 'LABEL SN-TIPE'), 'stream stempel tidak memuat isi label asli');
+    // stempel SN + marketplace di setiap halaman label
+    assert.ok(has(cTipe, 'SN-TIPE') && has(cTipe, 'SHOPEE'));
+    assert.ok(has(cRot, 'SN-ROT') && has(cRot, 'SHOPEE'));
+    assert.ok(has(c180, 'SN-180') && has(c180, 'TIKTOK'), 'nama marketplace mengikuti label');
+    // TIPE BELUM DITULIS hanya pada halaman yang diflag
+    assert.ok(has(cTipe, 'TIPE BELUM DITULIS'));
+    assert.ok(!has(cRot, 'TIPE BELUM DITULIS'));
+    assert.ok(!has(c180, 'TIPE BELUM DITULIS'));
+    // halaman tanpa rotasi: semua teks stempel tegak (a=1,b=0); halaman /Rotate 90: teks diputar (b=1,c=-1); 180: (a=-1,d=-1)
+    const round = (v) => Math.round(v);
+    const stampTipe = textMatrices(stampContent(doc, pages[1]));
+    assert.ok(stampTipe.length >= 3, `ada >= 3 teks stempel (dapat ${stampTipe.length})`);
+    assert.ok(stampTipe.every(([a, b]) => round(a) === 1 && round(b) === 0));
+    const stampRot = textMatrices(stampContent(doc, pages[2]));
+    assert.ok(stampRot.length >= 2);
+    assert.ok(stampRot.every(([, b, c]) => round(b) === 1 && round(c) === -1), `rotasi 90 dipakai: ${JSON.stringify(stampRot)}`);
+    const stamp180 = textMatrices(stampContent(doc, pages[3]));
+    assert.ok(stamp180.length >= 2);
+    assert.ok(stamp180.every(([a, , , d]) => round(a) === -1 && round(d) === -1), `rotasi 180 dipakai: ${JSON.stringify(stamp180)}`);
+    // halaman cover memuat info penting
+    const cCover = pageContent(doc, pages[0]);
+    for (const t of ['GLASS PRO SUITE', 'Part 1 (p1)', 'Jakarta (jkt)', '15/09/2026', 'Admin Glass Pro', '15092026-p1-ins-tg-jkt.pdf', 'Shopee']) assert.ok(has(cCover, t), `cover memuat "${t}"`);
+  });
+
   test('tanpa label -> hanya cover', async () => {
     const res = await pdf.buildLabelsPdf({ cover: { ...cover, order_count: 0 }, labels: [] });
     assert.equal(res.page_count, 1);

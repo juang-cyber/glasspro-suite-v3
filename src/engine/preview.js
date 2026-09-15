@@ -22,8 +22,8 @@ function num(v) { const n = Number(v); return Number.isFinite(n) ? n : 0; }
 // order: baris repo.getOrder (boleh sudah digabung dengan Derived terbaru).
 function toSummary(order, now) {
   const o = order || {};
-  const items = (Array.isArray(o.items) ? o.items : []).map((it) => {
-    const i = it || {};
+  // Entri null / bukan objek dibuang (konsisten dengan classify.classifyOrder).
+  const items = (Array.isArray(o.items) ? o.items : []).filter((it) => it && typeof it === 'object').map((i) => {
     return {
       item_name: i.item_name ?? null,
       model_name: i.model_name ?? null,
@@ -75,25 +75,33 @@ function toSummary(order, now) {
 // ---------- klasifikasi + simpan ----------
 // Klasifikasi & validasi satu order dengan setting saat ini, simpan via repo.setOrderDerived,
 // sinkronkan proc_status review <-> unprocessed. Mengembalikan order gabungan (row + derived).
-function classifyAndStore(order, settings, ctx, repo) {
+function classifyAndStore(order, settings, ctx = {}, repo) {
+  const now = Number(ctx.now) || time.now();
   const derived = classify.classifyOrder(order, settings);
-  const validation = validate.validateOrder(order, derived, settings, {
-    now: ctx.now, part: ctx.part || null, activeRunOrderSns: ctx.activeRunOrderSns,
-  });
-  const full = { ...derived, validation };
-  repo.setOrderDerived(order.order_sn, full);
+  // Validasi yang DISIMPAN bebas konteks (tanpa part & tanpa daftar run aktif): REGULAR_WAIT_P1 hanya berlaku
+  // saat preview p3 dan IN_PROGRESS dari run aktif berubah tiap saat. Kalau ikut disimpan, daftar order &
+  // KPI "ditahan" di dashboard menampilkan hold basi sampai sync berikutnya.
+  const stored = validate.validateOrder(order, derived, settings, { now });
+  repo.setOrderDerived(order.order_sn, { ...derived, validation: stored });
   let proc_status = order.proc_status;
-  if (validation.flags.needs_review && (proc_status === 'unprocessed' || proc_status === 'review')) {
+  if (stored.flags.needs_review && (proc_status === 'unprocessed' || proc_status === 'review')) {
     proc_status = 'review';
-  } else if (!validation.flags.needs_review && proc_status === 'review') {
+  } else if (!stored.flags.needs_review && proc_status === 'review') {
     proc_status = 'unprocessed';
   }
   if (proc_status !== order.proc_status) repo.setOrderProc(order.order_sn, { proc_status });
-  return { ...order, ...full, proc_status };
+  // Validasi KONTEKSTUAL (part / run aktif) hanya untuk hasil yang dikembalikan ke preview.
+  const active = ctx.activeRunOrderSns;
+  const hasCtx = !!ctx.part || !!(active && typeof active.has === 'function' && active.size);
+  const validation = hasCtx
+    ? validate.validateOrder(order, derived, settings, { now, part: ctx.part || null, activeRunOrderSns: active })
+    : stored;
+  return { ...order, ...derived, validation, proc_status };
 }
 
 // Klasifikasi ulang semua order yang belum processed/cancelled. Dipanggil setelah sync & ubah setting.
-function reclassifyAll(ctx = {}) {
+function reclassifyAll(ctx) {
+  if (!ctx || typeof ctx !== 'object') ctx = {};
   const repo = getRepo(ctx);
   const settings = getSettings(ctx, repo);
   const now = Number(ctx.now) || time.now();
@@ -154,7 +162,9 @@ function sortOrders(a, b) {
   return String(a.order_sn).localeCompare(String(b.order_sn));
 }
 
-function buildPreview({ part = 'auto', warehouse = 'all', include_processed = false } = {}, ctx = {}) {
+function buildPreview(opts, ctx) {
+  const { part = 'auto', warehouse = 'all', include_processed = false } = opts && typeof opts === 'object' ? opts : {};
+  if (!ctx || typeof ctx !== 'object') ctx = {};
   const repo = getRepo(ctx);
   const settings = getSettings(ctx, repo);
   const now = Number(ctx.now) || time.now();
@@ -163,9 +173,10 @@ function buildPreview({ part = 'auto', warehouse = 'all', include_processed = fa
   const whOrder = {}; whCodes.forEach((c, i) => { whOrder[c] = i; }); whOrder.all = 50;
 
   const part_auto = partEngine.currentPart(settings, now);
-  const selPart = !part || part === 'auto' ? part_auto.part : String(part);
+  const partIn = String(part || 'auto').trim().toLowerCase();
+  const selPart = partIn === 'auto' || partIn === '' ? part_auto.part : partIn;
   if (!partEngine.isValidPart(selPart)) throw badRequest(`Part tidak dikenal: ${part}`);
-  const selWh = warehouse ? String(warehouse) : 'all';
+  const selWh = String(warehouse || 'all').trim().toLowerCase() || 'all';
   if (selWh !== 'all' && !whCodes.includes(selWh)) throw badRequest(`Gudang tidak dikenal: ${warehouse}`);
   const mergeAll = selWh === 'all' && ((settings.process || DEFAULTS.process).all_warehouses_mode === 'merge');
 
@@ -207,9 +218,12 @@ function buildPreview({ part = 'auto', warehouse = 'all', include_processed = fa
       held.push({ ...summary, reasons: holds });
       continue;
     }
-    // masuk grup
+    // masuk grup. PDF hanya ada untuk tg/hg/mix; order berkategori 'review' yang lolos hold (force_process
+    // tanpa override kategori) dimasukkan ke 'mix' supaya nama file & cover tetap sesuai kontrak.
+    const effCat = naming.catCode(o.sku_category);
+    if (summary.sku_category !== effCat) summary.sku_category = effCat;
     const gwh = mergeAll ? 'all' : o.warehouse_code;
-    const gdef = { ship_type: o.ship_type, sku_category: o.sku_category, warehouse_code: gwh };
+    const gdef = { ship_type: o.ship_type, sku_category: effCat, warehouse_code: gwh };
     const key = naming.groupKey(gdef);
     if (!groupsMap.has(key)) {
       groupsMap.set(key, {
@@ -225,7 +239,7 @@ function buildPreview({ part = 'auto', warehouse = 'all', include_processed = fa
 
     totals.orders++;
     totals.products += summary.qty_total;
-    if (totals.by_category[o.sku_category] !== undefined) totals.by_category[o.sku_category]++;
+    if (totals.by_category[effCat] !== undefined) totals.by_category[effCat]++;
     if (totals.by_ship_type[o.ship_type] !== undefined) totals.by_ship_type[o.ship_type]++;
     if (o.warehouse_code) totals.by_warehouse[o.warehouse_code] = (totals.by_warehouse[o.warehouse_code] || 0) + 1;
     const mp = o.marketplace || 'shopee';

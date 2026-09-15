@@ -6,22 +6,27 @@ const SHIP_CODE = { instant: 'ins', regular: 'reg' };
 const SHIP_LABEL = { instant: 'Instant/Same Day', regular: 'Regular' };
 const CATEGORY_LABEL = { tg: 'TG', hg: 'HG', mix: 'Mix', review: 'Perlu Diperiksa' };
 
-function shipCode(shipType) { return SHIP_CODE[shipType] || String(shipType || 'reg').toLowerCase(); }
-function whCode(code) { return code ? String(code).toLowerCase() : 'all'; }
+const CATEGORY_CODES = ['tg', 'hg', 'mix'];
+
+// Kontrak: jenis pengiriman hanya instant|regular, kategori PDF hanya tg|hg|mix. Nilai lain (null, 'review'
+// dari order yang diproses paksa, huruf besar) dinormalkan supaya nama file & kunci grup selalu sesuai kontrak.
+function shipType(v) { return String(v || '').trim().toLowerCase() === 'instant' ? 'instant' : 'regular'; }
+function shipCode(v) { return SHIP_CODE[shipType(v)]; }
+function catCode(v) { const c = String(v || '').trim().toLowerCase(); return CATEGORY_CODES.includes(c) ? c : 'mix'; }
+function whCode(code) { const c = String(code || '').trim().toLowerCase(); return c || 'all'; }
 
 // 'DDMMYYYY-p1-ins-tg-jkt.pdf' atau 'DDMMYYYY-p1-productlist-jkt.pdf'
 function pdfFileName({ ts, part, ship_type, sku_category, warehouse_code, kind = 'labels' } = {}) {
   const date = time.ddmmyyyy(Number(ts) || time.now());
-  const p = String(part || 'p1').toLowerCase();
+  const p = String(part || 'p1').trim().toLowerCase();
   const wh = whCode(warehouse_code);
   if (kind === 'productlist') return `${date}-${p}-productlist-${wh}.pdf`;
-  const cat = String(sku_category || 'mix').toLowerCase();
-  return `${date}-${p}-${shipCode(ship_type)}-${cat}-${wh}.pdf`;
+  return `${date}-${p}-${shipCode(ship_type)}-${catCode(sku_category)}-${wh}.pdf`;
 }
 
-// 'instant-tg-jkt'
+// 'instant-tg-jkt' (normalisasi sama dengan pdfFileName agar satu grup selalu memetakan ke satu nama file)
 function groupKey({ ship_type, sku_category, warehouse_code } = {}) {
-  return `${ship_type || 'regular'}-${sku_category || 'mix'}-${whCode(warehouse_code)}`;
+  return `${shipType(ship_type)}-${catCode(sku_category)}-${whCode(warehouse_code)}`;
 }
 
 function shipTypeLabel(shipType) { return SHIP_LABEL[shipType] || String(shipType || '-'); }
@@ -38,4 +43,4 @@ function groupLabel({ ship_type, sku_category, warehouse_code } = {}, settings) 
   return `${shipTypeLabel(ship_type)} · ${categoryLabel(sku_category)} · ${warehouseLabel(warehouse_code, settings)}`;
 }
 
-module.exports = { pdfFileName, groupKey, groupLabel, shipTypeLabel, categoryLabel, warehouseLabel, shipCode };
+module.exports = { pdfFileName, groupKey, groupLabel, shipTypeLabel, categoryLabel, warehouseLabel, shipCode, catCode, CATEGORY_CODES };

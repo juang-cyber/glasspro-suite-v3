@@ -352,11 +352,14 @@ describe('process.regenerate', () => {
     await assert.rejects(proc.regenerate({ run_id: run1, only_failed: true, user: USER }, ctxWith(makeShopee())), (e) => e.status === 400);
   });
 
+  let run3; let run3Pdf;
   test('pdf_ids: bangun ulang PDF dari order sukses, PDF lama superseded', async () => {
     const shopee = makeShopee();
     const target = run1Pdfs.find((x) => x.kind === 'labels' && x.sku_category === 'tg' && x.ship_type === 'instant');
+    const processedAtBefore = repo.getOrder('O1').processed_at;
     await assert.rejects(proc.regenerate({ run_id: run1, pdf_ids: [999999], user: USER }, ctxWith(shopee)), (e) => e.status === 400);
     const { run_id } = await proc.regenerate({ run_id: run1, pdf_ids: [target.id], user: USER }, ctxWith(shopee));
+    run3 = run_id;
     const p = await waitFinished(run_id);
     assert.equal(p.status, 'done');
     assert.equal(p.summary.ok, 2);
@@ -365,16 +368,64 @@ describe('process.regenerate', () => {
     const old = repo.getPdf(target.id);
     assert.equal(old.status, 'superseded');
     assert.match(old.stale_reason, new RegExp(`run #${run_id}`));
+    // PDF lain di run sumber (2 label lain + 2 product list) tidak disentuh
+    const others = repo.listPdfs(run1).filter((x) => x.id !== target.id);
+    assert.equal(others.length, 4);
+    assert.ok(others.every((x) => x.status === 'ok'), 'PDF lain di run sumber tetap ok');
     const pdfs = repo.listPdfs(run_id);
     assert.equal(pdfs.length, 1, 'hanya label yang dipilih (product list lama masih berlaku)');
     assert.equal(pdfs[0].kind, 'labels');
     assert.deepEqual(pdfs[0].order_sns.sort(), ['O1', 'O2']);
     assert.ok(fs.existsSync(pdfs[0].file_path));
-    assert.equal(repo.getOrder('O1').proc_status, 'processed');
-    assert.equal(repo.getOrder('O1').proc_run_id, run_id);
+    run3Pdf = pdfs[0];
+    const o1 = repo.getOrder('O1');
+    assert.equal(o1.proc_status, 'processed');
+    assert.equal(o1.proc_run_id, run_id);
+    assert.equal(o1.pdf_stale, false);
+    assert.equal(o1.processed_at, processedAtBefore, 'rebuild PDF tidak mengubah waktu proses asli');
     const ros = repo.listRunOrders(run_id);
     assert.equal(ros.length, 2);
     assert.ok(ros.every((r) => r.status === 'ok' && r.stage === 'merged'));
+    // PDF yang sudah superseded tidak boleh dibuat ulang lagi dari run lama
+    await assert.rejects(proc.regenerate({ run_id: run1, pdf_ids: [target.id], user: USER }, ctxWith(makeShopee())), (e) => e.status === 400 && /digantikan/.test(e.message));
+  });
+
+  test('pdf_ids: order yang sudah batal dibuang dari PDF baru (run tetap done, tercatat skipped)', async () => {
+    // O2 dibatalkan di marketplace setelah PDF dibuat (sync menandai stale)
+    repo.setOrderProc('O2', { order_status: 'CANCELLED', proc_status: 'cancelled', pdf_stale: 1 });
+    repo.setOrderProc('O1', { pdf_stale: 1 });
+    const shopee = makeShopee();
+    const { run_id } = await proc.regenerate({ run_id: run3, pdf_ids: [run3Pdf.id], user: USER }, ctxWith(shopee));
+    const p0 = proc.getProgress(run_id);
+    assert.equal(p0.total, 2, 'total termasuk order yang dibuang');
+    const p = await waitFinished(run_id);
+    assert.equal(p.status, 'done', 'order batal bukan kegagalan');
+    assert.equal(p.done, 2);
+    assert.equal(p.summary.ok, 1);
+    assert.equal(p.summary.failed, 0);
+    assert.deepEqual(p.summary.dropped.map((x) => x.order_sn), ['O2']);
+    assert.deepEqual(p.dropped.map((x) => x.order_sn), ['O2']);
+    assert.deepEqual(shopee.calls.download, ['O1'], 'label order batal tidak diunduh');
+    const pdfs = repo.listPdfs(run_id);
+    assert.equal(pdfs.length, 1);
+    assert.deepEqual(pdfs[0].order_sns, ['O1']);
+    assert.equal(pdfs[0].order_count, 1);
+    assert.equal(repo.getPdf(run3Pdf.id).status, 'superseded');
+    const ro2 = repo.listRunOrders(run_id).find((r) => r.order_sn === 'O2');
+    assert.equal(ro2.status, 'skipped');
+    assert.match(ro2.error, /dibatalkan/);
+    assert.equal(repo.getOrder('O2').proc_status, 'cancelled', 'status order batal tidak diubah');
+    assert.equal(repo.getOrder('O1').pdf_stale, false, 'pdf_stale direset setelah PDF baru');
+    // rekonstruksi dari DB setelah "restart" konsisten
+    proc._internal.runs.delete(run_id);
+    const r = proc.getProgress(run_id);
+    assert.equal(r.total, 2); assert.equal(r.done, 2); assert.equal(r.status, 'done');
+    // semua order di PDF sudah batal -> 400
+    repo.setOrderProc('O1', { order_status: 'CANCELLED', proc_status: 'cancelled' });
+    await assert.rejects(proc.regenerate({ run_id, pdf_ids: [pdfs[0].id], user: USER }, ctxWith(makeShopee())), (e) => e.status === 400 && /sudah batal/.test(e.message));
+    // pulihkan untuk test berikutnya
+    repo.setOrderProc('O1', { order_status: 'PROCESSED', proc_status: 'processed', pdf_stale: 0 });
+    repo.setOrderProc('O2', { order_status: 'PROCESSED', proc_status: 'processed', pdf_stale: 0 });
   });
 
   test('tanpa only_failed & pdf_ids: semua PDF run sumber dibuat ulang', async () => {
@@ -432,6 +483,93 @@ describe('process: run yang terputus (orphan) dipulihkan', () => {
     assert.equal(repo.getOrder('O10').proc_status, 'failed');
     assert.equal(repo.listRunOrders(run.id)[0].status, 'failed');
     assert.equal(proc.getActiveRun().run_id, null);
+  });
+});
+
+describe('process: gudang "all" mode merge', () => {
+  test('satu PDF per (jenis kirim, kategori) berkode all; arrange tetap memakai gudang asli order', async () => {
+    repo.upsertOrder(orderRow('O11')); // instant tg jkt
+    repo.upsertOrder(orderRow('O12', { items: [sby(tgItem())] })); // instant tg sby
+    derive('O11', { ship_type: 'instant', sku_category: 'tg', warehouse_code: 'jkt' });
+    derive('O12', { ship_type: 'instant', sku_category: 'tg', warehouse_code: 'sby' });
+    const settings = settingsMapped({ process: { all_warehouses_mode: 'merge' } });
+    const shopee = makeShopee();
+    const { run_id } = await proc.startRun({ part: 'p2', warehouse: 'all', order_sns: ['O11', 'O12'], user: USER }, ctxWith(shopee, { settings }));
+    const p = await waitFinished(run_id);
+    assert.equal(p.status, 'done');
+    assert.equal(p.summary.ok, 2);
+    assert.deepEqual(shopee.calls.arrange.map((c) => [c.order_sn, c.warehouse]).sort(), [['O11', 'jkt'], ['O12', 'sby']], 'setting gudang asli diteruskan ke arrange');
+    const run = repo.getRun(run_id);
+    assert.equal(run.part, 'p2');
+    assert.equal(run.warehouse_filter, 'all');
+    const pdfs = repo.listPdfs(run_id);
+    const labels = pdfs.filter((x) => x.kind === 'labels');
+    const lists = pdfs.filter((x) => x.kind === 'productlist');
+    assert.equal(labels.length, 1, 'digabung jadi satu PDF');
+    assert.equal(labels[0].warehouse_code, 'all');
+    assert.equal(labels[0].file_name, `${time.ddmmyyyy(run.started_at)}-p2-ins-tg-all.pdf`);
+    assert.deepEqual(labels[0].order_sns.sort(), ['O11', 'O12']);
+    assert.equal(lists.length, 1);
+    assert.equal(lists[0].warehouse_code, 'all');
+    assert.equal(lists[0].file_name, `${time.ddmmyyyy(run.started_at)}-p2-productlist-all.pdf`);
+    assert.ok(run.summary.by_group['instant-tg-all']);
+    // run_orders tetap menyimpan gudang asli tiap order
+    const ros = repo.listRunOrders(run_id);
+    assert.equal(ros.find((r) => r.order_sn === 'O11').warehouse_code, 'jkt');
+    assert.equal(ros.find((r) => r.order_sn === 'O12').warehouse_code, 'sby');
+  });
+});
+
+describe('process: ketahanan pool (timeout, error, status tertinggal)', () => {
+  test('panggilan menggantung & dokumen tak kunjung siap gagal per order; order lain tetap selesai', async () => {
+    for (const sn of ['O13', 'O14', 'O15', 'O16', 'O17']) { repo.upsertOrder(orderRow(sn)); derive(sn, { ship_type: 'instant', sku_category: 'tg', warehouse_code: 'jkt' }); }
+    const base = makeShopee();
+    const shopee = {
+      ...base,
+      // O13: ship_order tidak pernah merespons
+      arrangeShipment(args) {
+        if (args.order_sn === 'O13') return new Promise(() => {});
+        if (args.order_sn === 'O17') { const e = new Error('Order O17 berstatus PROCESSED, bukan READY_TO_SHIP.'); e.code = 'logistics.error_status_limit'; return Promise.reject(e); }
+        return base.arrangeShipment(args);
+      },
+      // O14: dokumen selamanya PROCESSING
+      getShippingDocumentResult(args) {
+        if (args.order_list[0].order_sn === 'O14') return Promise.resolve({ result_list: [{ order_sn: 'O14', status: 'PROCESSING' }] });
+        return base.getShippingDocumentResult(args);
+      },
+      // O16: throw sinkron (bukan promise) saat membuat dokumen
+      createShippingDocument(args) {
+        if (args.order_list[0].order_sn === 'O16') throw new Error('boom sinkron');
+        return base.createShippingDocument(args);
+      },
+    };
+    const settings = settingsMapped({ process: { concurrency: 3, doc_wait_seconds: 0.3 } });
+    const t0 = Date.now();
+    const { run_id } = await proc.startRun({ part: 'p1', warehouse: 'jkt', order_sns: ['O13', 'O14', 'O15', 'O16', 'O17'], user: USER }, ctxWith(shopee, { settings, call_timeout_ms: 80 }));
+    const p = await waitFinished(run_id, 10000);
+    assert.ok(Date.now() - t0 < 5000, 'run selesai tanpa menunggu panggilan yang menggantung');
+    assert.equal(p.status, 'partial');
+    assert.equal(p.done, 5);
+    assert.equal(p.summary.ok, 2);
+    assert.equal(p.summary.failed, 3);
+    assert.equal(p.active.length, 0, 'tidak ada order yang tersisa "sedang berjalan"');
+    const err = (sn) => (p.errors.find((e) => e.order_sn === sn) || {}).error || '';
+    assert.match(err('O13'), /tidak merespons/);
+    assert.match(err('O14'), /belum siap setelah 0\.3 detik/);
+    assert.match(err('O16'), /boom sinkron/);
+    for (const sn of ['O13', 'O14', 'O16']) assert.equal(repo.getOrder(sn).proc_status, 'failed', sn);
+    const ro14 = repo.listRunOrders(run_id).find((r) => r.order_sn === 'O14');
+    assert.equal(ro14.stage, 'doc_requested');
+    // O17: status lokal READY_TO_SHIP tapi Shopee bilang sudah di-arrange -> lanjut ke dokumen, sukses
+    const o17 = repo.getOrder('O17');
+    assert.equal(o17.proc_status, 'processed');
+    assert.equal(o17.order_status, 'PROCESSED');
+    assert.equal(repo.getOrder('O15').proc_status, 'processed');
+    const labels = repo.listPdfs(run_id).filter((x) => x.kind === 'labels');
+    assert.equal(labels.length, 1);
+    assert.deepEqual(labels[0].order_sns.sort(), ['O15', 'O17'], 'PDF hanya dari order sukses');
+    const stages = repo.listRunOrders(run_id).map((r) => r.stage);
+    assert.ok(stages.every((s) => ['queued', 'shipping', 'doc_requested', 'doc_ready', 'downloaded', 'merged'].includes(s)), `tahapan sesuai kontrak: ${stages}`);
   });
 });
 
@@ -551,5 +689,31 @@ describe('route /api/process & /api/history', () => {
     assert.equal(j.part, 'p1');
     assert.ok(Array.isArray(j.groups));
     assert.ok(j.sync);
+  });
+
+  test('process: 409 saat masih ada run berjalan (run & regenerate), /active mengembalikan run itu', async () => {
+    repo.upsertOrder(orderRow('O18')); derive('O18', { ship_type: 'instant', sku_category: 'tg', warehouse_code: 'jkt' });
+    const gate = makeGate();
+    const shopee = makeShopee({ gate });
+    const { run_id } = await proc.startRun({ part: 'p1', warehouse: 'jkt', order_sns: ['O18'], user: USER }, ctxWith(shopee));
+    await gate.reached;
+    let r = await get('/api/process/active');
+    assert.deepEqual(await r.json(), { run_id, kind: 'process' });
+    r = await post('/api/process/run', { part: 'p1', warehouse: 'jkt' });
+    assert.equal(r.status, 409);
+    let j = await r.json();
+    assert.equal(j.error, 'conflict');
+    assert.equal(j.details.run_id, run_id);
+    r = await post(`/api/process/runs/${run1}/regenerate`, { only_failed: true });
+    assert.equal(r.status, 409);
+    r = await get(`/api/process/runs/${run_id}/progress`);
+    j = await r.json();
+    assert.equal(j.status, 'running');
+    assert.equal(j.finished, false);
+    assert.ok(j.active.some((a) => a.order_sn === 'O18' && a.stage === 'shipping'));
+    gate.release();
+    await waitFinished(run_id);
+    r = await get('/api/process/active');
+    assert.deepEqual(await r.json(), { run_id: null, kind: null });
   });
 });

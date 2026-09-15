@@ -24,12 +24,15 @@ function orderAddresses(list, warehouse) {
   return [...picked, ...rest];
 }
 
-// Pilih time slot: yang tanggalnya >= hari ini (WIB) jika ada field date, selain itu slot pertama.
+// Pilih time slot: slot berflag "recommended" (saran Shopee) didahulukan; selain itu slot pertama yang
+// tanggalnya >= hari ini (WIB) jika ada field date, atau slot pertama.
 function chooseSlot(slots, nowTs = now()) {
   const list = asList(slots).filter((s) => s && s.pickup_time_id !== undefined && s.pickup_time_id !== null && s.pickup_time_id !== '');
   if (!list.length) return null;
   const usable = list.filter((s) => !s.error);
   const pool = usable.length ? usable : list;
+  const recommended = pool.find((s) => asList(s.flags).includes('recommended'));
+  if (recommended) return recommended;
   const hasDate = pool.some((s) => Number.isFinite(Number(s.date)) && Number(s.date) > 0);
   if (hasDate) {
     const today = startOfDay(nowTs);
@@ -52,32 +55,44 @@ function pickMethod(info_needed, pref) {
   throw new ShopeeError('no_shipping_method', 'Shopee tidak memberikan metode pengiriman untuk order ini', { status: 400 });
 }
 
+// Bangun objek pickup untuk ship_order. Alamat dipilih sesuai prioritas (gudang -> pickup_address -> default).
+// Dokumentasi Shopee: "Some logistics channels may not return any date or time for pickup time slots. In such
+// cases, sellers can arrange shipment without selecting any time slot" -> bila alamat prioritas tidak punya slot,
+// kirim address_id saja (jangan pindah ke alamat/gudang lain hanya karena alamat itu punya slot).
 function buildPickup(params, info, warehouse) {
-  const list = asList(params.pickup && params.pickup.address_list);
-  if (!list.length) throw new ShopeeError('no_pickup_address', 'Tidak ada alamat pickup di akun Shopee', { status: 400 });
-  const needTime = asList(info).includes('pickup_time_id');
-  for (const addr of orderAddresses(list, warehouse)) {
-    if (addr.address_id === undefined || addr.address_id === null) continue;
-    if (!needTime) return { address_id: addr.address_id };
-    const slot = chooseSlot(addr.time_slot_list);
-    if (slot) return { address_id: addr.address_id, pickup_time_id: slot.pickup_time_id };
+  const need = asList(info);
+  if (need.includes('tracking_number') || need.includes('tracking_no')) {
+    throw new ShopeeError('unsupported_pickup', 'Pickup kurir ini butuh nomor resi manual (tracking_number), tidak bisa diproses otomatis', { status: 400 });
   }
-  throw new ShopeeError('no_pickup_slot', 'Tidak ada jadwal pickup yang tersedia untuk alamat manapun', { status: 400 });
+  const list = asList(params.pickup && params.pickup.address_list).filter((a) => a && a.address_id !== undefined && a.address_id !== null);
+  if (!list.length) throw new ShopeeError('no_pickup_address', 'Tidak ada alamat pickup di akun Shopee', { status: 400 });
+  const addr = orderAddresses(list, warehouse)[0];
+  if (!need.includes('pickup_time_id')) return { address_id: addr.address_id };
+  const slot = chooseSlot(addr.time_slot_list);
+  return slot ? { address_id: addr.address_id, pickup_time_id: slot.pickup_time_id } : { address_id: addr.address_id };
 }
 
+// Bangun objek dropoff untuk ship_order. info_needed.dropoff bisa memuat 'branch_id', 'sender_real_name',
+// 'tracking_no' (dokumentasi resmi; SDK memakai 'tracking_number'), dan 'slug' (TW). Untuk kurir 80003/80004
+// Shopee menawarkan JOB (sender_real_name) ATAU Regular (tracking_no) - hanya salah satu; kita pilih JOB karena
+// nomor resi manual tidak tersedia di aplikasi ini.
 function buildDropoff(params, info, settings) {
   const need = asList(info);
-  if (need.includes('tracking_number') || need.includes('slug')) {
-    throw new ShopeeError('unsupported_dropoff', 'Drop-off kurir ini butuh nomor resi manual', { status: 400 });
-  }
   const d = {};
   if (need.includes('branch_id')) {
     const branch = asList(params.dropoff && params.dropoff.branch_list)[0];
     if (!branch || branch.branch_id === undefined || branch.branch_id === null) throw new ShopeeError('no_dropoff_branch', 'Shopee tidak memberikan daftar cabang drop-off', { status: 400 });
     d.branch_id = branch.branch_id;
   }
+  if (need.includes('slug')) {
+    const slug = asList(params.dropoff && params.dropoff.slug_list)[0];
+    if (!slug || !slug.slug) throw new ShopeeError('unsupported_dropoff', 'Drop-off kurir ini butuh pilihan mitra 3PL (slug) yang tidak tersedia', { status: 400 });
+    d.slug = slug.slug;
+  }
   if (need.includes('sender_real_name')) {
     d.sender_real_name = (settings && settings.process && settings.process.sender_real_name) || 'Glass Pro';
+  } else if (need.includes('tracking_number') || need.includes('tracking_no')) {
+    throw new ShopeeError('unsupported_dropoff', 'Drop-off kurir ini butuh nomor resi manual', { status: 400 });
   }
   return d;
 }
@@ -136,6 +151,10 @@ function createLogistics({ client }) {
     if (shipping_document_type) body.shipping_document_type = shipping_document_type;
     const buf = await client.call({ path: '/api/v2/logistics/download_shipping_document', method: 'POST', body, shop_id, binary: true });
     if (!Buffer.isBuffer(buf) || !buf.length) throw new ShopeeError('empty_document', 'Shopee mengembalikan dokumen kosong');
+    // Waybill Shopee selalu PDF; HTML/teks (mis. halaman error gateway) jangan diteruskan ke penggabung PDF.
+    if (buf.subarray(0, 5).toString('latin1') !== '%PDF-') {
+      throw new ShopeeError('invalid_document', 'Berkas dari Shopee bukan PDF', { details: { snippet: buf.subarray(0, 120).toString('utf8') } });
+    }
     return buf;
   }
 

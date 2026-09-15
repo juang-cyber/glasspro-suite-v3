@@ -346,12 +346,19 @@ test('users CRUD (admin)', async () => {
 });
 
 test('staff: partner key ter-mask, PUT settings & users & reset -> 403', async () => {
+  const bt = await admin.req('PUT', '/api/settings', { 'shopee.bridge_token': 'tokenrahasia1234' });
+  assert.equal(bt.status, 200, JSON.stringify(bt.json));
   const u = await staff.login('staf1', 'rahasia2');
   assert.equal(u.role, 'staff');
   const g = await staff.get('/api/settings');
   assert.equal(g.status, 200);
   assert.equal(g.json['shopee.partner_key'], 'shpk****786f');
+  assert.equal(g.json['shopee.bridge_token'], '****1234');
   assert.ok(g.json.meta);
+  // Nilai ter-mask yang dikirim balik admin tidak menimpa token asli
+  const k3 = await admin.req('PUT', '/api/settings', { 'shopee.bridge_token': '****1234' });
+  assert.deepEqual(k3.json.skipped, ['shopee.bridge_token']);
+  assert.equal(repo.getSettings()['shopee.bridge_token'], 'tokenrahasia1234');
   assert.equal((await staff.req('PUT', '/api/settings', { sync: { interval_minutes: 3 } })).status, 403);
   assert.equal((await staff.get('/api/settings/users')).status, 403);
   assert.equal((await staff.post('/api/settings/users', { username: 'x1y2', password: 'rahasia1' })).status, 403);
@@ -368,4 +375,107 @@ test('admin menghapus staff -> sesi staff tidak berlaku lagi', async () => {
   assert.equal(d.json.ok, true);
   assert.equal((await staff.get('/api/auth/me')).status, 401);
   assert.equal((await admin.get('/api/settings/users')).json.users.some((x) => x.id === staffUser.id), false);
+});
+
+test('GET /api/orders: pemetaan filter warehouse/category/ship_type/proc_status', async () => {
+  // TEST-ORDER-001: override tg + sby, kurir instant. TEST-ORDER-002: hg, lokasi SBY-001 -> sby, kurir regular.
+  const q = async (p) => (await admin.get(`/api/orders?q=TEST-ORDER&${p}`)).json;
+  assert.deepEqual((await q('ship_type=regular')).items.map((o) => o.order_sn), ['TEST-ORDER-002']);
+  assert.deepEqual((await q('ship_type=instant')).items.map((o) => o.order_sn), [SN]);
+  assert.deepEqual((await q('category=hg')).items.map((o) => o.order_sn), ['TEST-ORDER-002']);
+  assert.deepEqual((await q('category=tg')).items.map((o) => o.order_sn), [SN]);
+  assert.equal((await q('warehouse=sby')).total, 2);
+  assert.equal((await q('warehouse=jkt')).total, 0);
+  assert.equal((await q('warehouse=jkt,sby')).total, 2);
+  assert.equal((await q('proc_status=processed')).total, 0);
+  assert.equal((await q('order_status=READY_TO_SHIP')).total, 2);
+  const it = (await q('category=hg')).items[0];
+  assert.equal(it.warehouse_code, 'sby');
+  assert.equal(it.sku_category, 'hg');
+  assert.equal(it.ship_type, 'regular');
+  assert.deepEqual(it.validation.holds, []);
+});
+
+test('PATCH overrides: proc_status review <-> unprocessed mengikuti klasifikasi; 409 saat sedang diproses', async () => {
+  repo.upsertOrder(orderRow('REV-001', {
+    items: [{ item_id: 3, item_name: 'Promo Bundle', item_sku: 'GP-UNIV-PROMO', model_id: 0, model_name: '', model_sku: '', qty: 1, price: 1000, product_location_id: 'SBY-001', order_item_id: 333, image_url: null }],
+  }));
+  let r = await admin.post('/api/orders/REV-001/reclassify');
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  assert.equal(r.json.order.proc_status, 'review');
+  assert.equal(r.json.order.sku_category, 'review');
+  assert.ok(r.json.order.validation.holds.some((h) => h.code === 'SKU_UNKNOWN'));
+  assert.equal(r.json.order.validation.flags.needs_review, true);
+
+  r = await admin.patch('/api/orders/REV-001/overrides', { sku_category: 'hg' });
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  assert.equal(r.json.order.proc_status, 'unprocessed');
+  assert.equal(r.json.order.sku_category, 'hg');
+  assert.equal(r.json.order.warehouse_code, 'sby');
+  assert.deepEqual(r.json.order.validation.holds, []);
+
+  r = await admin.patch('/api/orders/REV-001/overrides', { sku_category: null });
+  assert.equal(r.json.order.proc_status, 'review');
+  assert.equal(r.json.order.sku_category, 'review');
+
+  // Dikeluarkan manual: hold EXCLUDED, keluar dari antrian "Perlu Diperiksa" (needs_review false) -> unprocessed
+  r = await admin.patch('/api/orders/REV-001/overrides', { excluded: true });
+  assert.equal(r.status, 200);
+  assert.ok(r.json.order.validation.holds.some((h) => h.code === 'EXCLUDED'));
+  assert.equal(r.json.order.validation.flags.needs_review, false);
+  assert.equal(r.json.order.proc_status, 'unprocessed');
+
+  // Sedang diproses di run aktif -> override & reset ditolak 409
+  repo.setOrderProc('REV-001', { proc_status: 'processing', proc_run_id: 99 });
+  const c1 = await admin.patch('/api/orders/REV-001/overrides', { excluded: false });
+  assert.equal(c1.status, 409);
+  assert.equal(c1.json.error, 'conflict');
+  assert.equal((await admin.post('/api/orders/REV-001/reset')).status, 409);
+  repo.setOrderProc('REV-001', { proc_status: 'unprocessed', proc_run_id: null });
+});
+
+test('PUT /api/settings memicu reclassifyAll (kata kunci instant mengubah ship_type); key meta diabaikan', async () => {
+  assert.equal((await admin.get(`/api/orders/${SN}`)).json.order.ship_type, 'instant');
+  let r = await admin.req('PUT', '/api/settings', { shipping_rules: { instant_keywords: ['gosend'] }, meta: { warehouses_live: null } });
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  assert.deepEqual(r.json.settings.shipping_rules.instant_keywords, ['gosend']);
+  assert.equal((await admin.get(`/api/orders/${SN}`)).json.order.ship_type, 'regular');
+  r = await admin.req('PUT', '/api/settings', { shipping_rules: { instant_keywords: ['instant', 'same day', 'sameday', 'same-day'] } });
+  assert.equal(r.status, 200);
+  assert.equal((await admin.get(`/api/orders/${SN}`)).json.order.ship_type, 'instant');
+  assert.equal((await admin.req('PUT', '/api/settings', { meta: {} })).status, 400);
+});
+
+test('GET /api/dashboard: KPI hanya order yang bisa ditindak; processed_today, stale_pdf, held, instant_pending, orders_per_day', async () => {
+  repo.upsertOrder(orderRow('KPI-SHIPPED', { order_status: 'SHIPPED' })); // dikirim tanpa lewat app -> disembunyikan, bukan "belum diproses"
+  repo.upsertOrder(orderRow('KPI-HELD', { shipping_carrier: 'GoSend Same Day', items: [{ ...orderRow('x').items[0], model_name: 'Universal (tulis tipe di catatan)' }] })); // tipe HP kosong -> hold
+  repo.upsertOrder(orderRow('KPI-DONE'));
+  for (const sn of ['KPI-SHIPPED', 'KPI-HELD', 'KPI-DONE']) assert.equal((await admin.post(`/api/orders/${sn}/reclassify`)).status, 200, sn);
+  assert.ok(repo.getOrder('KPI-HELD').validation.holds.some((h) => h.code === 'PHONE_TYPE_MISSING'));
+  assert.ok(repo.getOrder('KPI-SHIPPED').validation.holds.some((h) => h.code === 'STATUS_NOT_READY'));
+  repo.setOrderProc('KPI-DONE', { proc_status: 'processed', processed_at: NOW, proc_run_id: 5, pdf_stale: 1 });
+
+  const r = await admin.get('/api/dashboard');
+  assert.equal(r.status, 200, JSON.stringify(r.json));
+  const d = r.json;
+  // Menunggu & bisa diproses: TEST-ORDER-001, TEST-ORDER-002, KPI-HELD, REV-001 (dikeluarkan manual) -> semua unprocessed
+  assert.equal(d.kpis.unprocessed, 4);
+  assert.equal(d.kpis.review, 0);
+  assert.equal(d.kpis.held, 1); // KPI-HELD; REV-001 masuk excluded, KPI-SHIPPED disembunyikan
+  assert.equal(d.kpis.excluded, 1);
+  assert.equal(d.kpis.instant_pending, 2); // TEST-ORDER-001 + KPI-HELD (Same Day)
+  assert.equal(d.kpis.processed_today, 1);
+  assert.equal(d.kpis.stale_pdf, 1);
+  assert.equal(d.kpis.failed, 0);
+  assert.equal(d.by_ship_type.instant + d.by_ship_type.regular, 4);
+  assert.equal(d.by_category.hg, 2); // TEST-ORDER-002, KPI-HELD
+  assert.equal(d.by_category.tg, 1); // TEST-ORDER-001 (override)
+  assert.equal(d.by_category.review, 1); // REV-001
+  assert.equal(d.by_warehouse.sby, 4);
+  assert.equal(d.orders_per_day.length, 14);
+  assert.equal(d.orders_per_day.reduce((a, x) => a + x.orders, 0), d.counts.total); // semua order dibuat < 14 hari lalu
+  assert.equal(d.orders_per_day.reduce((a, x) => a + x.processed, 0), 1);
+  assert.ok(d.orders_per_day.every((x, i, arr) => i === 0 || x.date > arr[i - 1].date));
+  assert.equal(d.timezone, 'Asia/Jakarta');
+  assert.equal(d.sync.marketplaces.shopee.connected, false);
 });

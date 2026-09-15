@@ -22,9 +22,14 @@ function str(v) {
 }
 function asList(v) {
   if (!v) return [];
-  if (Array.isArray(v)) return v.filter((x) => x !== null && x !== undefined && String(x).trim() !== '').map((x) => String(x).trim());
+  if (Array.isArray(v)) {
+    // Elemen bersarang (mis. product_location_id Shopee berupa array of string) diratakan.
+    return v.flat(Infinity).filter((x) => x !== null && x !== undefined && String(x).trim() !== '').map((x) => String(x).trim());
+  }
   return String(v).split(',').map((s) => s.trim()).filter(Boolean);
 }
+// Normalisasi ID lokasi/gudang untuk perbandingan: string, trim, huruf besar (Shopee tidak konsisten kapital).
+function normId(v) { return str(v).trim().toUpperCase(); }
 
 // ---------- jenis pengiriman ----------
 // 'instant' jika nama kurir mengandung salah satu instant_keywords (case-insensitive), selain itu 'regular'.
@@ -101,7 +106,8 @@ function mapWarehouseDetail(locationIds, settings) {
   const matched = [];
   const unmatched = [];
   for (const id of ids) {
-    const w = ws.find((x) => asList(x.location_ids).includes(id) || asList(x.warehouse_ids).includes(id));
+    const key = normId(id);
+    const w = ws.find((x) => asList(x.location_ids).map(normId).includes(key) || asList(x.warehouse_ids).map(normId).includes(key));
     if (w) matched.push(w.code);
     else unmatched.push(id);
   }
@@ -152,7 +158,9 @@ function extractPhoneType(order, item, settings) {
 // Apakah item wajib tipe HP sesuai sku_rules.require_phone_type.
 function phoneTypeRequired(item, category, settings) {
   const rules = skuRules(settings);
-  const req = rules.require_phone_type || { mode: 'all' };
+  let req = rules.require_phone_type || { mode: 'all' };
+  if (typeof req === 'string') req = { mode: req }; // bentuk lama: 'all' | 'patterns' | 'none'
+  if (typeof req !== 'object') req = { mode: 'all' };
   const mode = req.mode || 'all';
   if (mode === 'none') return false;
   if (mode === 'patterns') {
@@ -168,10 +176,10 @@ function phoneTypeRequired(item, category, settings) {
 function classifyOrder(order, settings) {
   const o = order || {};
   const overrides = (o.overrides && typeof o.overrides === 'object') ? o.overrides : {};
-  const rawItems = Array.isArray(o.items) ? o.items : [];
+  // Entri null / bukan objek (data rusak) dibuang: tidak membawa SKU/qty, jadi bukan "item tanpa kode".
+  const rawItems = (Array.isArray(o.items) ? o.items : []).filter((it) => it && typeof it === 'object');
 
-  const items = rawItems.map((it) => {
-    const item = it || {};
+  const items = rawItems.map((item) => {
     const cat = categorizeItem(item, settings);
     const category = cat === 'tg' || cat === 'hg' ? cat : null;
     const required = phoneTypeRequired(item, category, settings);
@@ -192,17 +200,19 @@ function classifyOrder(order, settings) {
   // Kategori order (item konflik dihitung sebagai 'conflict' → review)
   const cats = items.map((it) => (it.category_conflict ? 'conflict' : it.category));
   let sku_category = categorizeOrderItems(cats);
-  if (['tg', 'hg', 'mix'].includes(overrides.sku_category)) sku_category = overrides.sku_category;
+  const catOverride = str(overrides.sku_category).trim().toLowerCase();
+  if (['tg', 'hg', 'mix'].includes(catOverride)) sku_category = catOverride;
 
-  // Gudang
-  const locIds = items.map((it) => it.product_location_id).filter((v) => v !== null && v !== undefined && String(v).trim() !== '');
+  // Gudang (product_location_id bisa string atau array; asList meratakan & membuang yang kosong)
+  const locIds = asList(items.map((it) => it.product_location_id));
   const wh = mapWarehouseDetail(locIds, settings);
   let warehouse_code = wh.code;
   const validCodes = warehouseList(settings).map((w) => w.code);
-  if (overrides.warehouse_code && validCodes.includes(overrides.warehouse_code)) warehouse_code = overrides.warehouse_code;
+  const whOverride = str(overrides.warehouse_code).trim().toLowerCase();
+  if (whOverride && validCodes.includes(whOverride)) warehouse_code = whOverride;
 
-  // Jenis pengiriman
-  const ship_type = detectShipType(o.shipping_carrier || o.checkout_shipping_carrier, settings);
+  // Jenis pengiriman (shipping_carrier, fallback checkout_shipping_carrier)
+  const ship_type = detectShipType(str(o.shipping_carrier).trim() || o.checkout_shipping_carrier, settings);
 
   // Tipe HP tingkat order
   const requiredItems = items.filter((it) => it.phone_type_required);
@@ -219,7 +229,7 @@ function classifyOrder(order, settings) {
 
   return {
     warehouse_code,
-    warehouse_mixed: wh.mixed && !overrides.warehouse_code,
+    warehouse_mixed: wh.mixed && !whOverride,
     ship_type,
     sku_category,
     items,

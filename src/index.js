@@ -77,8 +77,16 @@ function createApp() {
   // Error handler JSON
   // eslint-disable-next-line no-unused-vars
   app.use((err, req, res, _next) => {
+    // Body JSON tidak valid dari express.json → 400 yang jelas
+    if (err && err.type === 'entity.parse.failed') {
+      return res.status(400).json({ error: 'bad_request', message: 'Body JSON tidak valid' });
+    }
+    if (err && err.type === 'entity.too.large') {
+      return res.status(413).json({ error: 'payload_too_large', message: 'Ukuran body terlalu besar' });
+    }
     const status = err.status || err.statusCode || 500;
-    if (status >= 500) log.error('unhandled', err);
+    if (status >= 500 && !err.expose) log.error('unhandled', err);
+    else if (status >= 500) log.warn(`${req.method} ${req.path} → ${status} ${err.code || ''}: ${err.message}`);
     res.status(status).json({ error: err.code || 'internal_error', message: err.expose || status < 500 ? err.message : 'Terjadi kesalahan pada server', details: err.details });
   });
 

@@ -12,9 +12,31 @@ const log = require('../util/log').make('process');
 const runs = new Map(); // run_id -> state (lihat newState)
 const MAX_KEPT_RUNS = 30; // jumlah run selesai yang disimpan di memori
 const FINAL_STATUSES = new Set(['ok', 'failed', 'skipped']);
+const CANCELLED_STATUSES = new Set(['CANCELLED', 'IN_CANCEL']);
+// Batas waktu per panggilan Shopee (pengaman pool: client sendiri punya timeout 60 dtk; ini lapis kedua).
+const CALL_TIMEOUT_MS = 120 * 1000;
+const DROPPED_REASON = 'Order dibatalkan di marketplace; tidak dimasukkan ke PDF';
+let orphansChecked = false;
 
 // ---------- util ----------
 const sleepDefault = (ms) => new Promise((r) => setTimeout(r, ms));
+
+// Bungkus promise dengan batas waktu supaya satu panggilan yang menggantung tidak memacetkan pool.
+function withTimeout(promise, ms, label) {
+  if (!(ms > 0)) return Promise.resolve(promise);
+  let timer;
+  const guard = new Promise((_, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label || 'Panggilan Shopee'} tidak merespons dalam ${Math.round(ms / 1000)} detik`)), ms);
+    if (timer.unref) timer.unref();
+  });
+  return Promise.race([Promise.resolve(promise), guard]).finally(() => clearTimeout(timer));
+}
+
+// Error dari ship_order yang berarti "shipment sudah diatur" (mis. staf sudah arrange di Seller Centre).
+function isAlreadyArrangedError(e) {
+  const text = `${(e && e.code) || ''} ${(e && e.message) || ''}`.toLowerCase();
+  return /status_limit|order_status|already|has been shipped|sudah diatur|bukan ready_to_ship|not ready_to_ship/.test(text);
+}
 
 function lazyRequire(p, label) {
   try {
@@ -40,6 +62,7 @@ function resolveDeps(ctx = {}) {
     shopee: () => ctx.shopee || lazyRequire('../shopee', 'shopee').create(),
     sleep: ctx.sleep || sleepDefault,
     pollMs: Number.isFinite(ctx.poll_ms) ? ctx.poll_ms : 2000,
+    callTimeoutMs: Number.isFinite(ctx.call_timeout_ms) ? ctx.call_timeout_ms : CALL_TIMEOUT_MS,
   };
 }
 
@@ -159,7 +182,11 @@ function newState({ run, kind, part, warehouse, user, note, settings, source_run
     run_id: run.id, kind, source_run_id: source_run_id || null, part, warehouse, user: user || null, note: note || null, settings,
     status: 'running', stage: 'shipping', done: 0, total: 0, current: null, errors: [], pdfs: [],
     finished: false, started_at: run.started_at, finished_at: null, summary: null, cancel: false,
-    orders: new Map(), groups: new Map(), productlist_rebuild: [], supersede_productlists: false, merge_mode: false,
+    orders: new Map(), groups: new Map(),
+    // regenerate: product list yang dipilih eksplisit untuk dibangun ulang; auto_productlists=false berarti
+    // product list TIDAK dibangun otomatis dari order sukses (hanya PDF yang dipilih).
+    productlist_rebuild: [], supersede_productlists: false, auto_productlists: true, merge_mode: false,
+    dropped: [], // order yang tidak ikut karena sudah batal (regenerate) -> {order_sn, reason}
   };
 }
 
@@ -170,6 +197,7 @@ function snapshot(st) {
     run_id: st.run_id, kind: st.kind, source_run_id: st.source_run_id, status: st.status, stage: st.stage, done: st.done, total: st.total,
     current: st.current, active, errors: st.errors.slice(), pdfs: st.pdfs.slice(), finished: st.finished,
     started_at: st.started_at, finished_at: st.finished_at, summary: st.summary, cancel_requested: st.cancel, part: st.part, warehouse: st.warehouse,
+    dropped: st.dropped.slice(),
   };
 }
 
@@ -204,7 +232,16 @@ function recoverOrphans(repo) {
   return n;
 }
 
+// Sekali per proses server: run 'running' sisa server sebelumnya ditandai gagal supaya preview tidak
+// terus menahan ordernya sebagai IN_PROGRESS.
+function ensureOrphansChecked() {
+  if (orphansChecked) return;
+  orphansChecked = true;
+  try { recoverOrphans(require('../db/repo')); } catch (e) { log.warn('pemeriksaan run terputus gagal:', shortError(e)); }
+}
+
 function getActiveOrderSns() {
+  ensureOrphansChecked();
   const set = new Set();
   for (const st of runs.values()) if (!st.finished) for (const sn of st.orders.keys()) set.add(sn);
   return set;
@@ -213,7 +250,8 @@ function getActiveOrderSns() {
 function getActiveRun() {
   const st = findActive();
   if (st) return { run_id: st.run_id, kind: st.kind };
-  try { recoverOrphans(require('../db/repo')); } catch { /* abaikan */ }
+  orphansChecked = true;
+  try { recoverOrphans(require('../db/repo')); } catch (e) { log.warn('recoverOrphans gagal:', shortError(e)); }
   return { run_id: null, kind: null };
 }
 
@@ -236,7 +274,8 @@ function failOrder(st, o, err, repo) {
   try {
     repo.upsertRunOrder(st.run_id, o.order_sn, { stage: o.stage, status: 'failed', error: msg });
     if (o.mode === 'process') repo.setOrderProc(o.order_sn, { proc_status: 'failed', last_error: msg });
-    else repo.setOrderProc(o.order_sn, { last_error: msg });
+    // rebuild: order tetap 'processed', tetapi PDF barunya tidak memuat order ini -> tandai perlu dibuat ulang
+    else repo.setOrderProc(o.order_sn, { last_error: msg, pdf_stale: 1 });
   } catch (e) { log.warn('failOrder simpan gagal:', shortError(e)); }
 }
 
@@ -260,27 +299,36 @@ function checkCreateResult(resp, orderSn) {
   throw new Error(`Gagal membuat dokumen: ${[err, msg].filter(Boolean).join(' - ')}`);
 }
 
+// Tahapan: queued -> shipping (ship_order hanya READY_TO_SHIP) -> doc_requested -> doc_ready -> downloaded -> merged.
+// Gagal -> 'failed' + error; order lain tetap lanjut. Semua error ditangkap di sini (pool tidak pernah macet).
 async function processOrder(st, d, shopee, o) {
   const { repo, settings } = d;
   const procSet = settings.process || {};
   const docType = procSet.document_type || 'NORMAL_AIR_WAYBILL';
   const waitSec = Number(procSet.doc_wait_seconds) > 0 ? Number(procSet.doc_wait_seconds) : 90;
-  setStage(st, o, 'shipping', repo);
+  const call = (label, p) => withTimeout(p, d.callTimeoutMs, label);
   try {
+    setStage(st, o, 'shipping', repo);
     const order = repo.getOrder(o.order_sn);
     if (!order) throw new Error('Order tidak ditemukan di database');
     const status = String(order.order_status || '').toUpperCase();
-    if (status === 'CANCELLED' || status === 'IN_CANCEL') throw new Error('Order dibatalkan di marketplace');
+    if (CANCELLED_STATUSES.has(status)) throw new Error('Order dibatalkan di marketplace');
     const shop_id = order.shop_id;
     const package_number = pickPackage(order);
     const warehouse = warehouseSetting(settings, o.warehouse_code || order.warehouse_code);
 
-    // (1) arrange shipment hanya untuk READY_TO_SHIP
+    // (1) arrange shipment hanya untuk READY_TO_SHIP (PROCESSED = sudah di-arrange, langsung dokumen)
     if (status === 'READY_TO_SHIP') {
-      const r = await shopee.arrangeShipment({ shop_id, order_sn: o.order_sn, package_number, warehouse, settings });
-      o.ship_result = r && r.method ? { method: r.method } : null;
+      try {
+        const r = await call('Atur pengiriman (ship_order)', shopee.arrangeShipment({ shop_id, order_sn: o.order_sn, package_number, warehouse, settings }));
+        o.ship_result = r && r.method ? { method: r.method } : null;
+      } catch (e) {
+        // Status lokal tertinggal (mis. sudah di-arrange lewat Seller Centre) -> lanjut ke dokumen
+        if (!isAlreadyArrangedError(e)) throw e;
+        log.warn(`ship_order ${o.order_sn}: shipment sudah diatur sebelumnya, lanjut ke dokumen (${shortError(e)})`);
+        o.ship_result = { method: 'existing' };
+      }
       try { repo.setOrderProc(o.order_sn, { order_status: 'PROCESSED' }); } catch { /* abaikan */ }
-      setStage(st, o, 'shipped', repo);
     }
 
     // (2) nomor resi: dari DB atau tanya Shopee (3x, jeda)
@@ -288,7 +336,7 @@ async function processOrder(st, d, shopee, o) {
     for (let i = 0; i < 3 && !tracking; i++) {
       if (i > 0) await d.sleep(d.pollMs);
       try {
-        const t = await shopee.getTrackingNumber({ shop_id, order_sn: o.order_sn, package_number });
+        const t = await call('Ambil nomor resi', shopee.getTrackingNumber({ shop_id, order_sn: o.order_sn, package_number }));
         tracking = t && typeof t === 'object' ? (t.tracking_number || null) : (t || null);
       } catch (e) { log.warn(`tracking ${o.order_sn} percobaan ${i + 1} gagal:`, shortError(e)); }
     }
@@ -299,24 +347,26 @@ async function processOrder(st, d, shopee, o) {
     setStage(st, o, 'doc_requested', repo);
     const entry = { order_sn: o.order_sn, package_number, shipping_document_type: docType };
     if (o.tracking_number) entry.tracking_number = o.tracking_number;
-    const created = await shopee.createShippingDocument({ shop_id, order_list: [entry] });
+    const created = await call('Buat dokumen', shopee.createShippingDocument({ shop_id, order_list: [entry] }));
     checkCreateResult(created, o.order_sn);
 
-    // (4) tunggu READY
+    // (4) tunggu READY, maksimal process.doc_wait_seconds
     const deadline = Date.now() + waitSec * 1000;
     for (;;) {
-      const rr = await shopee.getShippingDocumentResult({ shop_id, order_list: [{ order_sn: o.order_sn, package_number, shipping_document_type: docType }] });
+      const rr = await call('Cek status dokumen', shopee.getShippingDocumentResult({ shop_id, order_list: [{ order_sn: o.order_sn, package_number, shipping_document_type: docType }] }));
       const item = firstResult(rr, o.order_sn) || {};
       const ds = String(item.status || '').toUpperCase();
       if (ds === 'READY') break;
       if (ds === 'FAILED') throw new Error(`Dokumen gagal dibuat: ${item.fail_message || item.fail_error || 'tanpa keterangan'}`);
       if (Date.now() >= deadline) throw new Error(`Dokumen belum siap setelah ${waitSec} detik`);
+      // Catatan: pembatalan (st.cancel) TIDAK menghentikan order yang sedang berjalan — shipment sudah diatur di Shopee,
+      // labelnya harus tetap diambil. Order yang belum mulai dilewati di executeRun.
       await d.sleep(d.pollMs);
     }
     setStage(st, o, 'doc_ready', repo);
 
     // (5) unduh label
-    const raw = await shopee.downloadShippingDocument({ shop_id, shipping_document_type: docType, order_list: [{ order_sn: o.order_sn, package_number }] });
+    const raw = await call('Unduh label', shopee.downloadShippingDocument({ shop_id, shipping_document_type: docType, order_list: [{ order_sn: o.order_sn, package_number }] }));
     const buf = toBuffer(raw);
     if (!buf || !buf.length) throw new Error('File label kosong dari Shopee');
     o.buffer = buf;
@@ -329,16 +379,19 @@ async function processOrder(st, d, shopee, o) {
   }
 }
 
+// Pool paralel sederhana. Error worker ditangkap agar worker lain tetap jalan; dikembalikan sebagai daftar.
 async function runPool(items, concurrency, worker) {
   let idx = 0;
   const n = Math.max(1, Math.min(Number(concurrency) || 1, 20));
+  const errors = [];
   const workers = Array.from({ length: n }, async () => {
     while (idx < items.length) {
       const item = items[idx++];
-      await worker(item);
+      try { await worker(item); } catch (e) { errors.push({ item, error: e }); }
     }
   });
   await Promise.all(workers);
+  return errors;
 }
 
 // ---------- pembuatan PDF ----------
@@ -437,21 +490,34 @@ async function buildOneProductList(st, d, { warehouse_code, order_sns, supersede
   return row;
 }
 
+// Order yang masih berlaku untuk product list (ada di DB dan tidak batal).
+function liveOrderSns(repo, orderSns) {
+  const out = [];
+  for (const o of repo.getOrders(orderSns || [])) {
+    if (!o || o.proc_status === 'cancelled' || CANCELLED_STATUSES.has(String(o.order_status || '').toUpperCase())) continue;
+    out.push(o.order_sn);
+  }
+  return out;
+}
+
 async function buildProductLists(st, d) {
   const { repo } = d;
   const merged = [...st.orders.values()].filter((o) => o.status === 'merged');
-  // Product list yang diminta dibangun ulang langsung (regenerate pdf_ids berisi productlist)
+  // Product list yang diminta dibangun ulang langsung (regenerate pdf_ids berisi productlist); order batal dibuang.
   const handledWh = new Set();
   for (const p of st.productlist_rebuild || []) {
     try {
-      await buildOneProductList(st, d, { warehouse_code: p.warehouse_code, order_sns: p.order_sns || [], supersedes: [p.id] });
+      const sns = liveOrderSns(repo, p.order_sns || []);
+      if (!sns.length) throw new Error('Semua order di product list ini sudah batal');
+      await buildOneProductList(st, d, { warehouse_code: p.warehouse_code, order_sns: sns, supersedes: [p.id] });
       handledWh.add(p.warehouse_code);
     } catch (e) {
       log.error('Product list gagal dibuat ulang:', e);
       st.errors.push({ order_sn: null, error: `Product list ${p.warehouse_code} gagal: ${shortError(e)}` });
     }
   }
-  if (!merged.length) return;
+  // regenerate pdf_ids: hanya PDF yang dipilih; product list lama tetap berlaku
+  if (!st.auto_productlists || !merged.length) return;
   const byWh = new Map();
   for (const o of merged) {
     const wh = st.merge_mode ? 'all' : (o.warehouse_code || 'all');
@@ -487,7 +553,10 @@ function finalize(st, d) {
   for (const o of ok) {
     try {
       repo.upsertRunOrder(st.run_id, o.order_sn, { stage: 'merged', status: 'ok', error: null });
-      const patch = { proc_status: 'processed', processed_at: nowTs, pdf_stale: 0, proc_run_id: st.run_id, last_error: null };
+      const patch = { proc_status: 'processed', pdf_stale: 0, proc_run_id: st.run_id, last_error: null };
+      // rebuild PDF: waktu proses asli dipertahankan (KPI "diproses hari ini" tidak ikut berubah)
+      const prev = o.mode === 'rebuild' ? repo.getOrder(o.order_sn) : null;
+      patch.processed_at = prev && prev.processed_at ? prev.processed_at : nowTs;
       if (o.tracking_number) patch.tracking_number = o.tracking_number;
       repo.setOrderProc(o.order_sn, patch);
     } catch (e) { log.warn('finalize order gagal:', shortError(e)); }
@@ -510,6 +579,7 @@ function finalize(st, d) {
   const summary = {
     orders: all.length, ok: ok.length, failed: failed.length, skipped: skipped.length, pdfs: st.pdfs.length, by_group,
     cancelled: !!st.cancel, kind: st.kind, source_run_id: st.source_run_id, part: st.part, warehouse: st.warehouse,
+    dropped: st.dropped.slice(),
     pdf_list: st.pdfs.map((p) => ({ id: p.id, kind: p.kind, file_name: p.file_name, order_count: p.order_count, page_count: p.page_count })),
   };
   const errorText = status === 'failed' ? (st.cancel && !failed.length ? 'Dibatalkan pengguna' : (st.errors[0] && st.errors[0].error) || 'Tidak ada order yang berhasil') : null;
@@ -532,7 +602,7 @@ function fatal(st, d, err) {
     }
     const ok = [...st.orders.values()].filter((o) => o.status === 'merged').length;
     st.status = ok > 0 ? 'partial' : 'failed'; st.finished = true; st.finished_at = d.now(); st.stage = 'done'; st.current = null;
-    st.summary = { orders: st.orders.size, ok, failed: st.orders.size - ok, skipped: 0, pdfs: st.pdfs.length, by_group: {}, fatal: msg, kind: st.kind };
+    st.summary = { orders: st.orders.size, ok, failed: st.orders.size - ok, skipped: 0, pdfs: st.pdfs.length, by_group: {}, fatal: msg, kind: st.kind, dropped: st.dropped.slice() };
     d.repo.updateRun(st.run_id, { status: st.status, finished_at: st.finished_at, summary: st.summary, error: msg });
     d.repo.logActivity(st.user, st.kind === 'regenerate' ? 'regenerate_run' : 'process_run', String(st.run_id), st.summary);
   } catch (e) { log.error('fatal(): gagal menyimpan status:', e); }
@@ -540,16 +610,19 @@ function fatal(st, d, err) {
   pruneRuns();
 }
 
-async function executeRun(st, d) {
+async function executeRun(st, d, shopee) {
   try {
-    const shopee = d.shopee();
     const list = [...st.orders.values()];
     const concurrency = (d.settings.process && d.settings.process.concurrency) || 3;
     st.stage = list.length ? 'shipping' : 'pdf';
-    await runPool(list, concurrency, async (o) => {
+    const poolErrors = await runPool(list, concurrency, async (o) => {
       if (st.cancel) { skipOrder(st, o, d.repo); st.done++; return; }
       await processOrder(st, d, shopee, o);
     });
+    // processOrder menangkap semua error sendiri; ini pengaman terakhir supaya order tidak menggantung 'pending'
+    for (const { item, error } of poolErrors) {
+      if (item && !FINAL_STATUSES.has(item.status) && item.status !== 'merged') { failOrder(st, item, error, d.repo); st.done++; }
+    }
     st.stage = 'pdf'; st.current = null;
     await buildGroupPdfs(st, d);
     await buildProductLists(st, d);
@@ -573,14 +646,17 @@ function addOrderToState(st, { order_sn, mode, ship_type, sku_category, warehous
  */
 async function startRun({ part = 'auto', warehouse = 'all', order_sns, note, user, ignore_sync_block } = {}, ctx = {}) {
   const d = resolveDeps(ctx);
+  orphansChecked = true;
   recoverOrphans(d.repo);
-  const active = findActive('process');
-  if (active) throw conflict('Masih ada proses order yang sedang berjalan', { run_id: active.run_id });
+  // Run apa pun yang masih jalan (process maupun regenerate) memblokir run baru: satu run pada satu waktu.
+  const active = findActive();
+  if (active) throw conflict(active.kind === 'regenerate' ? 'Masih ada pembuatan ulang PDF yang sedang berjalan' : 'Masih ada proses order yang sedang berjalan', { run_id: active.run_id, kind: active.kind });
   part = String(part || 'auto').toLowerCase();
   warehouse = String(warehouse || 'all').toLowerCase();
   if (!['auto', 'p1', 'p2', 'p3'].includes(part)) throw badRequest('Part tidak valid (auto/p1/p2/p3)');
   if (!['all', 'jkt', 'sby'].includes(warehouse)) throw badRequest('Gudang tidak valid (all/jkt/sby)');
 
+  const shopee = d.shopee(); // 503 bila modul Shopee belum ada — sebelum run dibuat
   const previewMod = d.preview();
   const nowTs = d.now();
   const pv = previewMod.buildPreview({ part, warehouse }, { settings: d.settings, repo: d.repo, now: nowTs, activeRunOrderSns: getActiveOrderSns() });
@@ -616,7 +692,7 @@ async function startRun({ part = 'auto', warehouse = 'all', order_sns, note, use
   st.total = st.orders.size;
   runs.set(run.id, st);
   log.info(`run #${run.id} dimulai: part ${resolvedPart}, gudang ${warehouse}, ${st.total} order`);
-  setImmediate(() => executeRun(st, d).catch((e) => log.error('executeRun:', e)));
+  setImmediate(() => executeRun(st, d, shopee).catch((e) => log.error('executeRun:', e)));
   return { run_id: run.id };
 }
 
@@ -625,13 +701,15 @@ async function startRun({ part = 'auto', warehouse = 'all', order_sns, note, use
  */
 async function regenerate({ run_id, only_failed, pdf_ids, user, note } = {}, ctx = {}) {
   const d = resolveDeps(ctx);
+  orphansChecked = true;
   recoverOrphans(d.repo);
   const id = Number(run_id);
   const src = Number.isFinite(id) ? d.repo.getRun(id) : null;
   if (!src) throw notFound('Run tidak ditemukan');
   const active = findActive();
-  if (active) throw conflict('Masih ada run yang sedang berjalan', { run_id: active.run_id });
+  if (active) throw conflict('Masih ada run yang sedang berjalan', { run_id: active.run_id, kind: active.kind });
   if (src.status === 'running') throw conflict('Run sumber masih berjalan');
+  const shopee = d.shopee(); // 503 bila modul Shopee belum ada — sebelum run dibuat
 
   const srcRunOrders = d.repo.listRunOrders(id);
   const srcPdfs = d.repo.listPdfs(id);
@@ -639,16 +717,18 @@ async function regenerate({ run_id, only_failed, pdf_ids, user, note } = {}, ctx
   const warehouse = src.warehouse_filter || 'all';
   const mergeMode = warehouse === 'all' && d.settings.process && d.settings.process.all_warehouses_mode === 'merge';
   const tasks = []; // {order_sn, mode, ship_type, sku_category, warehouse_code, flags, marketplace, supersedes}
+  const dropped = []; // order batal yang tidak ikut rebuild -> {order_sn, reason, ship_type, sku_category, warehouse_code}
   const plRebuild = [];
   let supersedeLists = false;
-  const ts = d.now();
+  let autoLists = true;
+  const isCancelled = (order) => order.proc_status === 'cancelled' || CANCELLED_STATUSES.has(String(order.order_status || '').toUpperCase());
 
   if (only_failed) {
     for (const ro of srcRunOrders.filter((r) => r.status === 'failed')) {
       const order = d.repo.getOrder(ro.order_sn);
       if (!order) continue;
       if (!['failed', 'unprocessed'].includes(order.proc_status)) continue; // sudah diproses/dibatalkan lewat jalur lain
-      if (['CANCELLED', 'IN_CANCEL'].includes(String(order.order_status || '').toUpperCase())) continue;
+      if (isCancelled(order)) continue;
       tasks.push({
         order_sn: ro.order_sn, mode: 'process', ship_type: ro.ship_type || order.ship_type, sku_category: ro.sku_category || order.sku_category,
         warehouse_code: ro.warehouse_code || order.warehouse_code, flags: (order.validation && order.validation.flags) || ro.flags || {}, marketplace: order.marketplace, supersedes: [],
@@ -661,6 +741,9 @@ async function regenerate({ run_id, only_failed, pdf_ids, user, note } = {}, ctx
       const wanted = new Set(pdf_ids.map(Number));
       targets = srcPdfs.filter((p) => wanted.has(p.id));
       if (targets.length !== wanted.size) throw badRequest('Ada PDF yang tidak ditemukan di run ini');
+      const old = targets.find((p) => p.status === 'superseded');
+      if (old) throw badRequest(`PDF ${old.file_name} sudah digantikan oleh PDF yang lebih baru; buat ulang dari run penggantinya`);
+      autoLists = false; // hanya PDF yang dipilih yang dibangun ulang; PDF lain di run sumber tetap berlaku
     } else {
       supersedeLists = true;
     }
@@ -678,11 +761,16 @@ async function regenerate({ run_id, only_failed, pdf_ids, user, note } = {}, ctx
           warehouse_code: ro.warehouse_code || order.warehouse_code || p.warehouse_code, group_wh: p.warehouse_code,
           flags: (order.validation && order.validation.flags) || ro.flags || {}, marketplace: order.marketplace, supersedes: [p.id],
         };
-        seen.set(sn, t); tasks.push(t);
+        seen.set(sn, t);
+        // Order yang sudah batal tidak dimasukkan ke PDF baru (inilah alasan utama "buat ulang")
+        if (isCancelled(order)) { dropped.push({ order_sn: sn, reason: DROPPED_REASON, ship_type: t.ship_type, sku_category: t.sku_category, warehouse_code: t.warehouse_code, flags: t.flags }); continue; }
+        tasks.push(t);
       }
     }
     if (supersedeLists) plRebuild.length = 0; // regenerate semua: product list dibangun dari order sukses & yang lama di-supersede
-    if (!tasks.length && !plRebuild.length) throw badRequest('Tidak ada order di PDF yang dipilih');
+    if (!tasks.length && !plRebuild.length) {
+      throw badRequest(dropped.length ? 'Semua order di PDF yang dipilih sudah batal; tidak ada yang bisa dibuat ulang' : 'Tidak ada order di PDF yang dipilih');
+    }
   }
 
   const run = d.repo.createRun({ part, warehouse_filter: warehouse, kind: 'regenerate', user, note: note || `Dari run #${id}`, source_run_id: id });
@@ -690,18 +778,24 @@ async function regenerate({ run_id, only_failed, pdf_ids, user, note } = {}, ctx
   st.merge_mode = mergeMode;
   st.productlist_rebuild = plRebuild;
   st.supersede_productlists = supersedeLists;
+  st.auto_productlists = autoLists;
   for (const t of tasks) {
     const gwh = mergeMode ? 'all' : (t.group_wh || t.warehouse_code);
     const key = groupKey({ ship_type: t.ship_type, sku_category: t.sku_category, warehouse_code: gwh });
-    const file_name = pdfFileName({ ts, part, ship_type: t.ship_type, sku_category: t.sku_category, warehouse_code: gwh, kind: 'labels' });
+    const file_name = pdfFileName({ ts: run.started_at, part, ship_type: t.ship_type, sku_category: t.sku_category, warehouse_code: gwh, kind: 'labels' });
     addOrderToState(st, { ...t, group: { key, ship_type: t.ship_type, sku_category: t.sku_category, warehouse_code: gwh, file_name } });
     d.repo.upsertRunOrder(run.id, t.order_sn, { ship_type: t.ship_type, sku_category: t.sku_category, warehouse_code: t.warehouse_code, stage: 'queued', status: 'pending', error: null, flags: t.flags });
     if (t.mode === 'process') d.repo.setOrderProc(t.order_sn, { proc_status: 'processing', proc_run_id: run.id, last_error: null });
   }
-  st.total = st.orders.size;
+  for (const x of dropped) {
+    st.dropped.push({ order_sn: x.order_sn, reason: x.reason });
+    d.repo.upsertRunOrder(run.id, x.order_sn, { ship_type: x.ship_type, sku_category: x.sku_category, warehouse_code: x.warehouse_code, stage: 'queued', status: 'skipped', error: x.reason, flags: x.flags });
+  }
+  st.total = st.orders.size + dropped.length;
+  st.done = dropped.length;
   runs.set(run.id, st);
-  log.info(`run regenerate #${run.id} dari #${id}: ${st.total} order, ${plRebuild.length} product list`);
-  setImmediate(() => executeRun(st, d).catch((e) => log.error('executeRun:', e)));
+  log.info(`run regenerate #${run.id} dari #${id}: ${st.orders.size} order, ${plRebuild.length} product list, ${dropped.length} order batal dilewati`);
+  setImmediate(() => executeRun(st, d, shopee).catch((e) => log.error('executeRun:', e)));
   return { run_id: run.id };
 }
 
@@ -709,6 +803,8 @@ function getProgress(run_id) {
   const id = Number(run_id);
   const st = runs.get(id);
   if (st) return snapshot(st);
+  // Tidak ada di memori: rekonstruksi dari DB (run lama, atau server pernah dimulai ulang -> pulihkan dulu)
+  ensureOrphansChecked();
   const repo = require('../db/repo');
   const run = repo.getRun(id);
   if (!run) return null;

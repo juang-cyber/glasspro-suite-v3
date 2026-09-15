@@ -9,11 +9,14 @@ const DAY = 86400;
 const MAX_WINDOW_SEC = 15 * DAY;
 const LIST_PAGE_SIZE = 100;
 const DETAIL_BATCH = 50;
+// Hanya nilai yang tercantum resmi di dokumentasi get_order_detail (response_optional_fields "Available values").
+// checkout_shipping_carrier / reverse_shipping_fee TIDAK ada di daftar itu -> jangan diminta (risiko error_param);
+// keduanya tetap dibaca dari respons bila Shopee mengembalikannya bersama shipping_carrier.
 const DETAIL_FIELDS = [
   'buyer_user_id', 'buyer_username', 'estimated_shipping_fee', 'recipient_address', 'actual_shipping_fee', 'goods_to_declare', 'note', 'note_update_time',
   'item_list', 'pay_time', 'dropshipper', 'dropshipper_phone', 'split_up', 'buyer_cancel_reason', 'cancel_by', 'cancel_reason', 'actual_shipping_fee_confirmed',
   'buyer_cpf_id', 'fulfillment_flag', 'pickup_done_time', 'package_list', 'shipping_carrier', 'payment_method', 'total_amount', 'invoice_data',
-  'checkout_shipping_carrier', 'reverse_shipping_fee', 'order_chargeable_weight_gram', 'edt',
+  'order_chargeable_weight_gram', 'edt',
 ].join(',');
 
 const num = (v, def = null) => {
