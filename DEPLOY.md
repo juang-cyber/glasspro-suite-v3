@@ -98,7 +98,7 @@ Buka `http://localhost:3000`. Untuk demo tanpa Shopee: `SHOPEE_TRANSPORT=mock`.
 ## Deploy tanpa Coolify (cadangan)
 
 ```
-git clone https://github.com/juang-cyber/glasspro-suite-v3 && cd glasspro-suite
+git clone https://github.com/juang-cyber/glasspro-suite-v3 && cd glasspro-suite-v3
 cp .env.example .env   # isi nilai
 docker compose up -d --build
 ```
